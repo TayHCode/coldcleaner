@@ -1,5 +1,9 @@
 # Security
 
-This tool can delete files, push Git backup refs, restore archives and expire archived data. Review configuration before enabling any live cleanup tier. Do not include credentials, private hostnames or personal paths in reports or issue submissions.
+Coldcleaner deletes files, pushes Git backup refs, restores archives and expires archived data. Review your rules file and a dry-run report before enabling any live tier.
 
-This release candidate is unpublished and has no public security reporting channel. Report concerns to the maintainer through an already established private channel. No support or response-time commitment is offered.
+## Reporting a vulnerability
+
+Report vulnerabilities privately through GitHub: open this repository's **Security** tab and choose **Report a vulnerability**. Please do not open a public issue for a security problem.
+
+Include the affected version or commit, the rules settings involved and steps to reproduce. Remove credentials, hostnames and personal paths. Issues that can delete or expose data outside the configured paths are treated as the highest priority. This is a volunteer project, so there is no guaranteed response time.

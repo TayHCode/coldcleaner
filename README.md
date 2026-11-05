@@ -1,12 +1,30 @@
 # coldcleaner
 
+Coldcleaner runs every night and cleans up what coding agents leave behind. It checks what is already durable on GitHub, so it no longer needs a local copy, and deletes it. Anything else it removes is archived and verified first. Protections stop it from deleting your drive or breaking anything in use. The point is that drives stop filling up.
+
+## What it cleans and what it keeps
+
+It cleans only what you list in your rules file, and only for tiers you list in `live`:
+
+- **Git worktrees** under your configured `roots`, once their current head is published on GitHub and either merged or the head of a closed PR. A merged worktree must be idle 1 day (or `worktree_idle_days`, if lower); a worktree whose PR was closed without merging must be idle `worktree_idle_days` (7 in the example). It runs `git worktree remove` and deletes the worktree's local branch, unless the worktree is detached or another worktree has that branch checked out. Ignored files inside are archived first.
+- **Scratch, evidence, staging and temp folders** you list under `archive`, once idle `archive_idle_days` (4 in the example). System temp paths (`/tmp`, `/var/tmp`, Windows `AppData\Local\Temp` and `Windows\Temp`) must be idle at least 7 days. Each is archived, every file's SHA-256 is compared, and only then is the source deleted.
+
+It keeps, and never deletes:
+
+- Remote branches, GitHub repositories and anything on GitHub.
+- Virtual machines, VM disks, containers, Docker volumes and services.
+- Package caches (pip, npm, uv, cargo and similar).
+- Anything a scheduler names, a running process has open, a `.keep-local` file marks, or that changed within its idle window.
+- Git work that is not proven on GitHub: dirty files, stashes, unpushed commits, open PRs, and published heads that are neither merged nor the head of a closed PR.
+- Folders you did not list. Big unknown folders appear in the report only.
+
 ## Safety: will it erase my drive?
 
 Not if you keep to the defaults. It only acts on what you list, and it keeps a verified copy of anything it removes that exists nowhere else.
 
 - **Dry run by default.** Nothing is deleted, moved or pushed unless you pass `--apply` and the tier is listed in `live` in your rules file. The example rules ship with `live = []`.
 - **Only listed paths.** It acts on paths and patterns in your rules file and nothing else. Unknown big folders are reported, never touched.
-- **Protected items stay.** Deletion is blocked for paths named by a scheduler (cron, systemd, launchd, Task Scheduler), files open in a running process (lsof), folders with a `.keep-local` file, files changed within the idle window (example defaults: 4 days for archives, 7 for worktrees, 28 for whole projects), and Git work without a verified remote copy.
+- **Protected items stay.** Deletion is blocked for paths named by a scheduler (cron, systemd, launchd, Task Scheduler), files open in a running process (lsof), folders with a `.keep-local` file, files changed within the idle window (example defaults: 4 days for archives, 7 for worktrees, or 1 once merged, 28 for whole projects), and Git work without a verified remote copy.
 - **Verified copy first.** Before it removes data that exists nowhere else (ignored files, staging, evidence), it archives it, compares a SHA-256 for every file, and only then deletes. A worktree is removed only after its commits are proven published on GitHub, and ignored data inside it is archived with a Git recovery bundle.
 - **Restorable.** `restore ID` puts an archive back, or just one file with `--member`, or somewhere else with `--to`. It refuses to overwrite an existing path.
 - **Safe with Git.** It never force-pushes and never creates GitHub repositories.
@@ -41,6 +59,53 @@ python3 -m coldcleaner --help
 ```
 
 Choose writable archive and report directories. The example has one local POSIX host, `live = []`, and empty cleanup paths. Configure hosts only in `rules.toml`. Each `[hosts.<name>]` table requires `kind` (`posix`, `powershell` or `wsl`) and accepts `ssh` and optional `distro`. A `posix` host without `ssh` runs on this machine; `powershell` and `wsl` hosts require `ssh`, because the controller runs on Linux or macOS. Commented examples show remote POSIX and Windows hosts. Rules files written before hosts moved into configuration are refused until every host table declares `kind`; add `ssh = "<destination>"` to each remote host, because a table without `ssh` runs on this machine. macOS needs Bash 3.2 and Python 3.9 or newer. WSL execution remains retired. Native Windows uses PowerShell. Remote execution goes through `coldcleaner/hosts.py`.
+
+### Run it every night
+
+Review a dry-run report first, then add the tiers you want to `live` in your rules file, for example `live = ["worktree", "archive"]`. With `live = []`, `reclaim --apply` refuses to run and exits 2. Worktree cleanup needs [`gh`](https://cli.github.com/) logged in (`gh auth status`) to prove merges on GitHub.
+
+Run these from the shell you used for the quickstart. `command -v coldcleaner gh` must print both paths: the scheduled run reuses that shell's `PATH`, the installed `coldcleaner` and your rules file.
+
+On Linux, install a systemd user timer (04:30 local time):
+
+```sh
+config="${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner"
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/coldcleaner.service <<EOF
+[Unit]
+Description=coldcleaner nightly reclaim
+
+[Service]
+Type=oneshot
+Environment="PATH=$PATH"
+ExecStart="$(command -v coldcleaner)" reclaim --apply --rules "$config/rules.toml" --report-dir "$config/reports"
+Nice=10
+IOSchedulingClass=idle
+EOF
+cat > ~/.config/systemd/user/coldcleaner.timer <<EOF
+[Unit]
+Description=Nightly coldcleaner run
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now coldcleaner.timer
+loginctl enable-linger "$USER"
+```
+
+`loginctl enable-linger` lets the timer run while you are logged out. Check it with `systemctl --user list-timers coldcleaner.timer` and read a run with `journalctl --user -u coldcleaner.service`. The service exits 1 when a host stays at or above `alert_pct` or a step fails; add `OnFailure=<your-alert>.service` under `[Unit]` to be notified. To stop the nightly run: `systemctl --user disable --now coldcleaner.timer`.
+
+On macOS, or without systemd, add a cron entry instead:
+
+```sh
+config="${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner"
+( crontab -l 2>/dev/null; echo "30 4 * * * PATH='$PATH' '$(command -v coldcleaner)' reclaim --apply --rules '$config/rules.toml' --report-dir '$config/reports'" ) | crontab -
+```
 
 ### Archive to a local or external drive (no NAS)
 
@@ -100,8 +165,6 @@ Dry runs still inspect configured hosts over SSH and write a report. POSIX and W
 
 `--to PATH` replaces the archived root, including when `--member` selects one file. For an archive rooted at `.scratch`, `--to /tmp/recovered --member .scratch/evidence.txt` writes `/tmp/recovered/evidence.txt`. The target `/tmp/recovered` must not already exist.
 
-The units under `systemd/` schedule `reclaim --apply` at 04:30 UTC and alert on failure. Only tiers listed in `live` in `rules.toml` can act. `scripts/install.sh` backs up existing units, copies them and enables the user timer. Installation is a separate operator action.
-
 GitHub inventory tables show counts for dirty files, untracked files, unpushed refs and stashes. Backup action rows show the number of planned or pushed refs; blocked-backup messages remain visible. Git safety checks still inspect every ref.
 
 Each run writes a separate timestamped Markdown report in `~/.local/state/coldcleaner/reports/`. Each host has before/after usage, all proposed and applied actions with byte estimates, and repos needing GitHub backup. Skipped items are summarized by reason with counts and bytes; all cache candidates include their age and minimum age, while only the 20 largest other skipped items are listed individually. Reports do not scan for the largest home folders. Estimates use logical file sizes. A skip or incomplete check does not count toward estimated savings. Exit code 1 means a host remains at or above 80%, is unreachable, or a cleanup step failed.
@@ -136,12 +199,14 @@ Each entry in `actions` has `tier`, `action`, `path`, `bytes` and `reason`. `ski
 
 ## Limitations
 
-This is an unpublished release candidate licensed under the MIT License. See `LICENSE` for the copyright notice and terms.
+Coldcleaner is licensed under the MIT License. See `LICENSE` for the copyright notice and terms.
 
-Native Windows GitHub inventory and projects with nested repositories need manual review. Open-file protection uses lsof on POSIX hosts. Incomplete protection checks retain candidates. Verification uses temporary directories, local Git remotes and fake host boundaries; it does not establish correctness on every remote system. Review every live cleanup configuration before use. A cache entry with `days` may set `failed_days` (at least `days`, POSIX hosts only): a directory whose `.cold/verify-history.jsonl` ends in a failing run is kept that long instead. Cache directories referenced by a running process (command line, environment or working directory, read from `/proc` for the same user) are never removed. `clone = true` treats each match as one unit: it retains clones with ignored or untracked files or submodules, and removes others only while their GitHub safety verdict is `on_github`; both checks run again just before removal. A `/tmp` or `/var/tmp` cache entry needs `days` of at least 7 and an `owner`, which must be your own username (not root). The public export does not include deployment units, scheduled jobs, CI workflows or private history.
+Native Windows GitHub inventory and projects with nested repositories need manual review. Open-file protection uses lsof on POSIX hosts. Incomplete protection checks retain candidates. Verification uses temporary directories, local Git remotes and fake host boundaries; it does not establish correctness on every remote system. Review every live cleanup configuration before use. A cache entry with `days` may set `failed_days` (at least `days`, POSIX hosts only): a directory whose `.cold/verify-history.jsonl` ends in a failing run is kept that long instead. Cache directories referenced by a running process (command line, environment or working directory, read from `/proc` for the same user) are never removed. `clone = true` treats each match as one unit: it retains clones with ignored or untracked files or submodules, and removes others only while their GitHub safety verdict is `on_github`; both checks run again just before removal. A `/tmp` or `/var/tmp` cache entry needs `days` of at least 7 and an `owner`, which must be your own username (not root).
 
 ## Development
 
-Run tests with `python3 -m unittest discover -s tests -v`. Tests use temporary files and fake hosts, without contacting the NAS or GitHub. Before merging, commit and push the PR changes. Confirm `git status --porcelain` prints nothing and `git rev-parse HEAD` matches `gh pr view N --json headRefOid --jq .headRefOid`. CI/test proof runs from a fresh checkout of that exact commit using `GIT_ALLOW_PROTOCOL=file nice -n 10 bash .fleet/verify.sh`. Keep the result and source identity. Rerun after behavior changes. Windows verification and the legacy agentlocker verify loop are retired. No GitHub runner, workflow, service or VM is installed by this proof.
+1. Install Python 3.14, Git, tar and zstd.
+2. Clone the repository and run the offline tests from its root: `python3 -m unittest discover -s tests -v`.
+3. Open a pull request with a test for the behavior you changed. See `CONTRIBUTING.md`.
 
-Run the offline tests shown above. They exercise Git safety, archive verification and restore, cleanup protection, reporting and host command encoding. Archive tests require local tar and zstd. Tests must not contact real hosts, the archive share or GitHub.
+The tests exercise Git safety, archive verification and restore, cleanup protection, reporting and host command encoding. They use temporary directories, local bare Git remotes and fake hosts, and never contact real machines, archive storage or GitHub.

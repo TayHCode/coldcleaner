@@ -1079,6 +1079,15 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(os.getxattr(source / 'unique', 'user.coldcleaner-test'), b'private metadata')
         self.assertFalse((self.root / 'nas').exists())
 
+    def test_guard_rejects_filesystem_root_and_home(self):
+        home = self.root / 'home'; home.mkdir()
+        with patch.dict(os.environ, HOME=str(home)), patch.object(reclaim_probe, 'threads', return_value=[]), \
+                patch.object(reclaim_probe, 'references', return_value=[]):
+            for path in ('/', Path('/'), str(home), str(home) + '/', home, str(home / 'x' / '..'), 'relative/dir'):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'invalid cleanup root'):
+                    reclaim_probe.guard(path)
+        self.assertTrue(home.is_dir())
+
     def test_guard_retains_process_thread_recent_symlink_and_keep_local(self):
         source = self.root / 'evidence'; source.mkdir(); (source / 'data').write_text('unique')
         alias = self.root / 'alias'; alias.symlink_to(source, target_is_directory=True)
