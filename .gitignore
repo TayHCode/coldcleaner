@@ -1,0 +1,8 @@
+.worktrees/
+.scratch/
+__pycache__/
+*.pyc
+/.worktrees/
+/reports/
+build/
+*.egg-info/

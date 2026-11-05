@@ -1,0 +1,35 @@
+hard_pct = 85
+alert_pct = 80
+cache_idle_days = 0 # No additional cache inactivity requirement.
+compact_idle_days = 0 # No additional compaction inactivity requirement.
+worktree_idle_days = 7
+archive_idle_days = 4
+project_idle_days = 28
+nas_cap_gb = 500
+nas_root = "/srv/coldcleaner/archive"
+local_archive_mount = ""
+report_dir = "/srv/coldcleaner/reports"
+compact_weekday = "sun"
+live = []
+regenerable_paths = ["node_modules", ".venv", "venv", "target", "dist", "build", "__pycache__", ".cache", ".next"]
+already_compressed_extensions = [".zip", ".gz", ".zst", ".7z", ".jpg", ".jpeg", ".png", ".mp4", ".mov", ".mp3", ".flac", ".gguf", ".safetensors"]
+
+[hosts.local]
+kind = "posix"
+shared_roots = []
+roots = []
+archive = []
+compact = []
+cache = []
+
+# Remote POSIX example. Uncomment and set your SSH destination and paths.
+# [hosts.server]
+# kind = "posix"
+# ssh = "server.example.invalid"
+# roots = ["~/projects"]
+
+# Native Windows example.
+# [hosts.windows]
+# kind = "powershell"
+# ssh = "windows.example.invalid"
+# roots = ['%USERPROFILE%\REPOS']

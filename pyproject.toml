@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldcleaner"
+version = "0.1.0"
+description = "Dry-run-first disk cleanup for Linux, macOS, Windows and WSL hosts, controlled from one machine."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+coldcleaner = "coldcleaner.cli:main"
+
+[tool.setuptools]
+packages = ["coldcleaner"]
