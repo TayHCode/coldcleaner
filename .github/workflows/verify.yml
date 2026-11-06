@@ -6,11 +6,14 @@ on:
   workflow_dispatch:
 jobs:
   verify:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, coldbox]
-    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'unverified-fork' || 'verify' }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted", "coldbox"]') }}
     timeout-minutes: 60
     steps:
+      - name: Refuse fork pull requests
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Fork pull requests are not verified on Coldbox." >&2
+          exit 1
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
