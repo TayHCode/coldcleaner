@@ -421,11 +421,26 @@ def package_cache(path):
                 {'.cache', '.npm', '.cargo', '.bun', 'node-compile-cache', 'npm-cache', 'pip-cache', 'uv-cache', 'go-build'})
 
 
+def reject_package_caches(root):
+    pending = [root]
+    while pending:
+        item = pending.pop()
+        if package_cache(item):
+            raise ValueError('package caches are excluded: ' + str(item))
+        try:
+            with os.scandir(item) as entries:
+                pending.extend(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False)
+                               and not getattr(entry.stat(follow_symlinks=False), 'st_file_attributes', 0) & 1024)
+        except OSError:
+            continue
+
+
 def tree(path, hashes=False):
     present(path)
     path = Path(path)
     mount_boundary(path)
     path = Path(extended(path))
+    reject_package_caches(path)
     result = {}; security = {}; allocated = logical = files = 0; newest = path.lstat().st_mtime
     device = path.lstat().st_dev
     pending = [path]
@@ -497,16 +512,42 @@ def guard(path, days=0, activity=None):
     return info
 
 
-def repo(path, listing=''):
+NOT_A_REPOSITORY = re.compile(r'fatal: (invalid gitfile format|not a git repository \(or any )')
+BAD_CONFIG = re.compile(r'fatal: bad config line \d+ in file ')
+
+
+def disposable_stub(path, message=''):
+    marker = Path(path) / '.git'
+    if marker.is_file():
+        return message.startswith('fatal: invalid gitfile format')
+    if not marker.is_dir() or marker.is_symlink():
+        return False
+    if any(entry.is_symlink() or not entry.is_dir() for entry in marker.iterdir()):
+        return False
+    return not any(files for name in ('refs', 'logs', 'worktrees') for _, _, files in os.walk(marker / name))
+
+
+def repo(path, listing='', stub_ok=False):
     present(path)
-    top = git(path, 'rev-parse', '--show-toplevel')
+    shown = git(path, 'rev-parse', '--show-toplevel', check=False)
+    if shown.returncode:
+        message = shown.stderr.strip()
+        if stub_ok and NOT_A_REPOSITORY.match(message) and disposable_stub(path, message):
+            return None
+        raise RuntimeError(message or 'Git check failed')
+    top = shown.stdout.strip()
     if os.path.normcase(os.path.realpath(top)) != os.path.normcase(os.path.realpath(path)):
+        if stub_ok and disposable_stub(path):
+            return None
         raise ValueError('not a repository root')
     local_refs = git(path, 'for-each-ref', '--format=%(refname)',
                      'refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
     if local_refs:
         raise ValueError('per-worktree refs require preservation: ' + ', '.join(local_refs.splitlines()))
-    head = git(path, 'rev-parse', 'HEAD')
+    head = git(path, 'rev-parse', '--verify', '-q', 'HEAD', check=False).stdout.strip()
+    target = git(path, 'symbolic-ref', '-q', 'HEAD', check=False).stdout.strip()
+    if not head and (not target.startswith('refs/heads/') or git(path, 'for-each-ref', '--format=%(refname)', target)):
+        head = git(path, 'rev-parse', 'HEAD')
     branch = git(path, 'symbolic-ref', '-q', '--short', 'HEAD', check=False).stdout.strip()
     dirty = bool(git(path, 'status', '--porcelain=v1', '--untracked-files=all'))
     flags = git(path, 'ls-files', '-v').splitlines()
@@ -519,12 +560,12 @@ def repo(path, listing=''):
         raise ValueError('Git grafts prevent ancestry proof')
     refs = dict((line.split()[1], line.split()[0]) for line in listing.splitlines() if len(line.split()) == 2)
     published = head in refs.values()
-    if not published:
+    if not published and head:
         containing = set(git(path, 'for-each-ref', '--format=%(objectname)', '--contains', head).splitlines())
         published = bool(containing & set(refs.values()))
     merged = False
     main = refs.get('refs/heads/main') or refs.get('refs/heads/master')
-    if main and git(path, 'cat-file', '-e', main + '^{commit}', check=False).returncode == 0:
+    if main and head and git(path, 'cat-file', '-e', main + '^{commit}', check=False).returncode == 0:
         merged = git(path, 'merge-base', '--is-ancestor', head, main, check=False).returncode == 0
         published = published or merged
     if published and (Path(path) / '.git').is_file():
@@ -545,6 +586,13 @@ def repo(path, listing=''):
                 remote=git(path, 'remote', 'get-url', 'origin', check=False).stdout.strip())
 
 
+def own_config_fails(path):
+    env = {key: value for key, value in os.environ.items() if key not in ('GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS')}
+    result = subprocess.run(['git', '-C', str(path), 'worktree', 'list', '--porcelain'], capture_output=True, text=True,
+                            env={**env, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull})
+    return bool(BAD_CONFIG.match(result.stderr.strip()))
+
+
 def discover(roots):
     found = set()
     errors, notes = [], []
@@ -552,13 +600,18 @@ def discover(roots):
         root = os.path.expandvars(os.path.expanduser(root))
         if not os.path.isdir(root):
             continue
-        for base, dirs, files in os.walk(root, onerror=lambda e: errors.append(str(e))):
+        for base, dirs, files in os.walk(root, onerror=lambda e: notes.append('Unreadable, skipped: ' + str(e))
+                                         if isinstance(e, PermissionError) else errors.append(str(e))):
             if '.git' in dirs or '.git' in files:
                 try:
                     result = git(base, 'worktree', 'list', '--porcelain')
                 except RuntimeError as exc:
-                    benign = re.match(r'fatal: (invalid gitfile format|not a git repository \(or any )', str(exc))
-                    (notes if benign else errors).append(base + ': ' + str(exc))
+                    if NOT_A_REPOSITORY.match(str(exc)):
+                        notes.append('Not a repository, skipped: ' + base + ': ' + str(exc))
+                    elif BAD_CONFIG.match(str(exc)) and own_config_fails(base):
+                        notes.append('Git cannot read this repository, skipped: ' + base + ': ' + str(exc))
+                    else:
+                        errors.append(base + ': ' + str(exc))
                     dirs[:] = [d for d in dirs if d != '.git']
                     continue
                 found.add(os.path.normpath(base))
@@ -596,7 +649,7 @@ def main(request):
         import glob
         return sorted(set(p for pattern in request['patterns'] for p in glob.glob(os.path.expandvars(os.path.expanduser(pattern)))))
     if op == 'repo':
-        return repo(path, request.get('listing', ''))
+        return repo(path, request.get('listing', ''), request.get('stub_ok', False))
     if op == 'context':
         parent = path if Path(path).is_dir() else str(Path(path).parent)
         result = git(parent, 'rev-parse', '--show-toplevel', check=False)

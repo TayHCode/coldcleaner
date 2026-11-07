@@ -376,7 +376,13 @@ class Reclaimer:
         if context and context not in contexts:
             contexts.append(context)
         for context in contexts:
-            state = probe(self.host, 'repo', path=context)
+            state = probe(self.host, 'repo', path=context, stub_ok=True)
+            if state is None:
+                note = f'Not a repository, skipped: {context}: .git holds no HEAD, index, refs or reflogs'
+                if note not in self.report.notes:
+                    self.report.notes.append(note)
+                allow_git = True
+                continue
             inside = os.path.normcase(context.replace('\\', '/')).startswith(os.path.normcase(path.replace('\\', '/')).rstrip('/') + '/')
             same = os.path.normcase(context.replace('\\', '/')) == os.path.normcase(path.replace('\\', '/'))
             if archive and (same or inside) and state['worktree']:
@@ -423,7 +429,7 @@ class Reclaimer:
         discovery = probe(self.host, 'discover', roots=self.rules.get('roots', []))
         paths = discovery['paths']
         self.report.errors.extend('Worktree discovery incomplete: ' + error for error in discovery['errors'])
-        self.report.notes.extend('Not a repository, skipped: ' + note for note in discovery['notes'])
+        self.report.notes.extend(discovery['notes'])
         self.checked = self.protection.batch(paths, allow_git=True) if self.host.kind != 'powershell' else {}
         for path in paths:
             size = 0

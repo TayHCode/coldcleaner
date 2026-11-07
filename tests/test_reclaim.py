@@ -755,6 +755,59 @@ class ReclaimTests(unittest.TestCase):
         self.assertTrue(any(str(broken) in note for note in found['notes']))
         self.assertEqual((broken / '.git').read_text(), 'invalid')
 
+    def stale_archive_with_nested_git_stub(self, held=None):
+        stamp = time.time() - 8 * 86400
+        temp = self.root / ('tmpstub-' + (held or 'empty').replace('/', '-'))
+        stub = temp / 'runs' / 'work' / '.git' / 'objects'
+        stub.mkdir(parents=True)
+        if held:
+            (stub.parent / held).parent.mkdir(parents=True, exist_ok=True)
+            (stub.parent / held).write_text('0' * 40)
+        (temp / 'runs' / 'work' / 'data').write_text('scratch')
+        for path in (*temp.rglob('*'), temp):
+            os.utime(path, (stamp, stamp))
+        self.config['archive_idle_days'] = 4
+        self.config['hosts']['test']['archive'] = [str(temp)]
+        self.entry.actions.clear()
+        return temp
+
+    def test_broken_nested_git_stub_is_a_note_but_a_broken_repository_with_git_data_is_an_error(self):
+        stub = self.stale_archive_with_nested_git_stub()
+        damaged = {name: self.stale_archive_with_nested_git_stub(data) for name, data in (
+            ('refs', 'refs/heads/main'), ('worktrees', 'worktrees/linked/gitdir'), ('packed-refs', 'packed-refs'),
+            ('logs', 'logs/HEAD'), ('index', 'index'), ('orig-head', 'ORIG_HEAD'), ('config', 'config'))}
+        self.config['hosts']['test']['archive'] = [str(stub), *map(str, damaged.values())]
+        self.entry.actions.clear()
+        self.engine.archives()
+        actions = {row['path']: row for row in self.entry.actions}
+        self.assertEqual(actions[str(stub)]['action'], 'would archive and remove')
+        for name, path in damaged.items():
+            self.assertEqual(actions[str(path)]['action'], 'error', name)
+            self.assertIn('not a git repository', actions[str(path)]['reason'], name)
+        self.assertEqual(len(self.entry.notes), 1)
+        self.assertIn(str(stub / 'runs' / 'work'), self.entry.notes[0])
+
+    def test_broken_nested_git_stub_inside_an_enclosing_repository_is_still_a_stub(self):
+        enclosing = self.root / 'enclosing'; enclosing.mkdir()
+        self.git(enclosing, 'init', '-b', 'main')
+        stub = enclosing / 'scratch'
+        (stub / '.git' / 'objects').mkdir(parents=True)
+        request = dict(operation='repo', path=str(stub), stub_ok=True)
+        found = []
+        self.assertIsNone(self.failure(lambda: found.append(reclaim_probe.main(request))))
+        self.assertEqual(found, [None])
+        (stub / '.git' / 'index').write_text('staged')
+        with self.assertRaisesRegex(ValueError, 'not a repository root'):
+            reclaim_probe.main(request)
+        with self.assertRaisesRegex(ValueError, 'not a repository root'):
+            reclaim_probe.main(dict(request, stub_ok=False))
+
+    def test_broken_nested_git_stub_marks_the_git_check_satisfied(self):
+        self.stale_archive_with_nested_git_stub()
+        self.engine.archives()
+        self.protection.reason.assert_called()
+        self.assertTrue(self.protection.reason.call_args.kwargs['allow_git'])
+
     def test_non_repository_markers_are_notes_and_do_not_fail_the_host(self):
         broken = self.root / 'backup'; broken.mkdir(); (broken / '.git').mkdir()
         self.config['hosts']['test']['roots'] = [str(self.root)]
@@ -772,6 +825,56 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(found['notes'], [])
         self.assertEqual(len(found['errors']), 1)
         self.assertIn('dubious ownership', found['errors'][0])
+
+    def test_unreadable_folders_and_unloadable_repositories_are_retained_as_notes(self):
+        locked = self.root / 'container-evidence'; locked.mkdir(); locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        include = self.root / 'not-git-config.json'; include.write_text('{"key": "value"}\n')
+        fixture = self.root / 'config-include'
+        self.git(self.root, 'init', '-q', str(fixture))
+        self.git(fixture, 'config', 'include.path', str(include))
+        self.config['hosts']['test']['roots'] = [str(self.root)]
+        self.engine.worktrees()
+        self.assertEqual(self.entry.errors, [])
+        self.assertEqual(len(self.entry.notes), 2)
+        self.assertTrue(any('Unreadable, skipped' in note and str(locked) in note for note in self.entry.notes))
+        self.assertTrue(any('Git cannot read' in note and str(fixture) in note for note in self.entry.notes))
+        self.assertEqual(self.entry.actions, [])
+        self.assertTrue((fixture / '.git').is_dir())
+        healthy = self.root / 'healthy'
+        self.git(self.root, 'init', '-q', '-b', 'main', str(healthy))
+        self.git(healthy, '-c', 'user.name=t', '-c', 'user.email=t@localhost', 'commit', '-q', '--allow-empty', '-m', 'base')
+        conditional = self.root / 'global.gitconfig'
+        conditional.write_text(f'[includeIf "onbranch:main"]\n\tpath = {include}\n')
+        for shared in (dict(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='include.path', GIT_CONFIG_VALUE_0=str(include)),
+                       dict(GIT_CONFIG_GLOBAL=str(conditional))):
+            with patch.dict(os.environ, shared):
+                found = reclaim_probe.discover([str(self.root)])
+            self.assertTrue(any(str(healthy) in error and 'bad config' in error for error in found['errors']), shared)
+            self.assertFalse(any(str(healthy) in note for note in found['notes']), shared)
+
+    def test_empty_unborn_repository_is_archived_but_one_with_staged_work_is_kept(self):
+        stamp = time.time() - 8 * 86400
+        scratch = {}
+        for name in ('empty', 'staged', 'tagged'):
+            scratch[name] = self.root / name
+            repo = scratch[name] / 'base' / 'self-product'
+            self.git(self.root, 'init', '-q', '-b', 'master', str(repo))
+            if name == 'staged':
+                (repo / 'draft.txt').write_text('only copy')
+                self.git(repo, 'add', 'draft.txt')
+            if name == 'tagged':
+                self.git(repo, 'symbolic-ref', 'HEAD', 'refs/tags/missing')
+            for path in (*scratch[name].rglob('*'), scratch[name]):
+                os.utime(path, (stamp, stamp))
+        self.config['archive_idle_days'] = 4
+        self.config['hosts']['test']['archive'] = [str(path) for path in scratch.values()]
+        self.engine.archives()
+        actions = {row['path']: row for row in self.entry.actions}
+        self.assertEqual(actions[str(scratch['empty'])]['action'], 'would archive and remove')
+        self.assertEqual(actions[str(scratch['staged'])]['action'], 'skip')
+        self.assertIn('uncommitted work', actions[str(scratch['staged'])]['reason'])
+        self.assertEqual(actions[str(scratch['tagged'])]['action'], 'error')
 
     def test_worktree_with_missing_gitdir_stays_an_error(self):
         orphan = self.root / 'orphan'; orphan.mkdir()
@@ -920,6 +1023,16 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual((cache / 'package').read_text(), 'leave package caches alone')
         self.assertIn('package caches', self.entry.actions[-1]['reason'])
         self.assertFalse((self.root / 'nas').exists())
+
+    def test_package_cache_is_rejected_before_any_per_file_safety_check(self):
+        source = self.root / 'prereqs'
+        for index in range(20):
+            (source / 'build' / str(index)).mkdir(parents=True)
+        (source / '.cache' / 'uv').mkdir(parents=True)
+        with patch.object(os, 'listxattr', wraps=os.listxattr) as safety:
+            with self.assertRaisesRegex(ValueError, 'package caches are excluded'):
+                reclaim_probe.tree(source)
+        safety.assert_not_called()
 
     def test_archive_parent_retains_its_registered_worktree(self):
         repo, work = self.worktree()
