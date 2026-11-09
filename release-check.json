@@ -1,8 +1,8 @@
 {
   "quickstart": [
     {
-      "file": "README.md",
-      "line": 52,
+      "file": "docs/reference.md",
+      "line": 10,
       "argv": [
         "python3",
         "-m",
@@ -12,8 +12,8 @@
       ]
     },
     {
-      "file": "README.md",
-      "line": 58,
+      "file": "docs/reference.md",
+      "line": 16,
       "argv": [
         "python3",
         "-m",
@@ -316,6 +316,34 @@
       "path": "tests/test_reclaim.py",
       "fingerprint": "dd4caf99e0b69111",
       "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "internal-host",
+      "path": "README.md",
+      "fingerprint": "95a40ca5edbce963",
+      "reason": "The generic host name local used by the example configuration, not a private machine."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "e1bf92542b227512",
+      "reason": "Generic placeholder macOS home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "internal-host",
+      "path": "README.md",
+      "fingerprint": "95a40ca5edbce963",
+      "reason": "The generic host name local used by the example configuration, not a private machine."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "e1bf92542b227512",
+      "reason": "Generic placeholder macOS home path in a test fixture, not a real account."
     }
   ]
 }

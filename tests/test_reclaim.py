@@ -1,10 +1,12 @@
 import contextlib
+from contextlib import closing
 import ctypes
 import hashlib
 import io
 import json
 import shutil
 import os
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -44,6 +46,7 @@ class ReclaimTests(unittest.TestCase):
         self.env.start(); self.addCleanup(self.env.stop)
         original = reclaim_probe.main
         self.read_threads = reclaim_probe.threads
+        self.read_codex = getattr(reclaim_probe, 'codex_threads', None)
         self.read_references = reclaim_probe.references
         self.read_drivers = getattr(reclaim_probe, 'drivers', None)
         for name, value in (('drivers', []), ('exited', False)):
@@ -56,8 +59,8 @@ class ReclaimTests(unittest.TestCase):
                 raise
             except Exception as exc:
                 raise RuntimeError(str(exc)) from None
-        for target, value in ((reclaim_probe, 'references'), (reclaim_probe, 'threads')):
-            mock = patch.object(target, value, return_value=[])
+        for target, value in ((reclaim_probe, 'references'), (reclaim_probe, 'threads'), (reclaim_probe, 'codex_threads')):
+            mock = patch.object(target, value, create=True, return_value=[])
             mock.start(); self.addCleanup(mock.stop)
         mock = patch.object(reclaim, 'probe', side_effect=local_probe)
         mock.start(); self.addCleanup(mock.stop)
@@ -158,6 +161,108 @@ class ReclaimTests(unittest.TestCase):
                 self.assertIsInstance(raised, ValueError, raised)
                 self.assertIn('no longer exists', str(raised))
 
+    def written(self, path, size):
+        path.write_bytes(os.urandom(size))
+        deadline = time.monotonic() + 30
+        while path.stat().st_blocks * 512 < size and time.monotonic() < deadline:
+            time.sleep(0.1)
+
+    def skipped_worktrees(self, apply=False):
+        repo, unique = self.worktree()
+        self.written(unique / 'unpushed', 200_000)
+        self.git(unique, 'add', '.'); self.git(unique, 'commit', '-m', 'local only')
+        dirty = self.root / 'dirty'
+        self.git(repo, 'worktree', 'add', '-b', 'dirty', str(dirty))
+        self.git(repo, 'push', 'origin', 'dirty')
+        self.written(dirty / 'draft', 1_000_000)
+        calls = []
+        local = reclaim.probe.side_effect
+        def counted(host, operation, **request):
+            calls.append(operation)
+            return local(host, operation, **request)
+        self.engine.apply = apply
+        with patch.object(reclaim, 'probe', side_effect=counted):
+            self.engine.worktrees()
+        return {row['path']: row for row in self.entry.actions}, calls, unique, dirty
+
+    def test_skipped_worktrees_report_real_bytes_from_one_sizing_call(self):
+        rows, calls, unique, dirty = self.skipped_worktrees()
+        self.assertIn('UNIQUE', rows[str(unique)]['reason'])
+        self.assertIn('uncommitted', rows[str(dirty)]['reason'])
+        self.assertGreaterEqual(rows[str(unique)]['bytes'], 200_000)
+        self.assertGreaterEqual(rows[str(dirty)]['bytes'], 1_000_000)
+        self.assertEqual(calls.count('sizes'), 1)
+        self.assertEqual(self.entry.notes, [])
+        text = report.render([self.entry])
+        self.assertIn(f"| UNIQUE: unpushed commits or incomplete origin proof | 1 | {rows[str(unique)]['bytes']} |", text)
+        largest = text.split('Largest 20 skipped:')[1]
+        self.assertLess(largest.index(str(dirty)), largest.index(str(unique)))
+
+    def test_apply_logs_skipped_worktrees_with_measured_bytes(self):
+        rows, _, unique, dirty = self.skipped_worktrees(apply=True)
+        logged = [json.loads(line) for line in (self.root / 'reports' / 'reclaim-actions.jsonl').read_text().splitlines()]
+        self.assertEqual({row['path']: row['bytes'] for row in logged},
+                         {str(unique): rows[str(unique)]['bytes'], str(dirty): rows[str(dirty)]['bytes']})
+        self.assertTrue(all(row['bytes'] >= 200_000 for row in logged))
+
+    def test_skip_sizes_that_fail_keep_zero_bytes_and_still_log(self):
+        local = reclaim.probe.side_effect
+        def failing(host, operation, **request):
+            if operation == 'sizes':
+                raise RuntimeError('ssh dropped')
+            return local(host, operation, **request)
+        with patch.object(reclaim.probe, 'side_effect', failing):
+            rows, _, unique, dirty = self.skipped_worktrees(apply=True)
+        self.assertEqual((rows[str(unique)]['bytes'], rows[str(dirty)]['bytes']), (0, 0))
+        self.assertEqual(self.entry.notes, ['worktree skip sizes unavailable: ssh dropped'])
+        logged = (self.root / 'reports' / 'reclaim-actions.jsonl').read_text().splitlines()
+        self.assertEqual(len(logged), 2)
+
+    def test_skip_sizes_past_the_budget_are_reported_as_lower_bounds(self):
+        with patch.object(reclaim, 'SIZE_SECONDS', 0, create=True):
+            rows, calls, unique, dirty = self.skipped_worktrees()
+        self.assertNotIn('sizes', calls)
+        self.assertEqual(self.entry.notes, ['worktree skip sizes: 2 are lower bounds (unreadable entries or the 0s cap)'])
+
+    def sizes(self, paths, seconds=60):
+        try:
+            return reclaim_probe.main(dict(operation='sizes', paths=[str(path) for path in paths], seconds=seconds))
+        except ValueError as exc:
+            self.fail(f'sizes probe refused: {exc}')
+
+    def test_sizes_probe_is_bounded_and_does_not_follow_links(self):
+        outside = self.root / 'outside'; outside.write_bytes(os.urandom(2_000_000))
+        target = self.root / 'target'; (target / 'nested').mkdir(parents=True)
+        data = target / 'nested' / 'data'
+        self.written(data, 300_000)
+        (target / 'link').symlink_to(outside)
+        (target / 'dirlink').symlink_to(self.root)
+        tree, single, gone = self.sizes([target, data, self.root / 'gone'])
+        self.assertTrue(tree['complete'])
+        self.assertGreaterEqual(tree['bytes'], 300_000)
+        self.assertLess(tree['bytes'], 2_000_000)
+        self.assertEqual(single, dict(bytes=os.lstat(data).st_blocks * 512, complete=True))
+        self.assertEqual(gone, dict(bytes=0, complete=True))
+        self.assertFalse(self.sizes([target], seconds=-1)[0]['complete'])
+
+    def test_sizes_probe_checks_the_deadline_between_entries(self):
+        flat = self.root / 'flat'; flat.mkdir()
+        for name in ('a', 'b', 'c'):
+            (flat / name).write_bytes(b'x')
+        clock = iter([0, 0] + [100] * 10)
+        with patch.object(reclaim_probe.time, 'monotonic', side_effect=lambda: next(clock)):
+            found, = self.sizes([flat], seconds=10)
+        self.assertFalse(found['complete'])
+
+    @unittest.skipIf(os.geteuid() == 0, 'root reads mode 000 directories')
+    def test_sizes_probe_marks_unreadable_directories_incomplete(self):
+        target = self.root / 'target'; locked = target / 'locked'
+        locked.mkdir(parents=True); (locked / 'data').write_bytes(b'x')
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        found, = self.sizes([target])
+        self.assertFalse(found['complete'])
+
     def test_worktree_whose_github_repository_is_gone_is_skipped(self):
         repo, work = self.worktree()
         self.git(work, 'remote', 'set-url', 'origin', 'https://github.com/me/gone.git')
@@ -202,6 +307,115 @@ class ReclaimTests(unittest.TestCase):
                 reclaim_probe.subprocess, 'run', return_value=Mock(stdout=json.dumps(rows))), patch.object(
                 reclaim_probe, 'windows_arguments', return_value=['python.exe', r'C:\job\worker.py']):
             self.assertEqual(self.read_references(), [r'C:\Python\python.exe', r'C:\job\worker.py'])
+
+    def read_darwin_references(self, lsof, ps):
+        def run(command, **kwargs):
+            return lsof if 'lsof' in command else ps
+        with patch.object(reclaim_probe.sys, 'platform', 'darwin'), patch.object(
+                reclaim_probe.os, 'geteuid', return_value=501), patch.object(
+                reclaim_probe.subprocess, 'run', side_effect=run) as calls:
+            try:
+                return self.read_references(), None, calls
+            except Exception as error:
+                return None, error, calls
+
+    def test_darwin_inventory_reads_open_files_and_command_lines_with_sudo(self):
+        lsof = Mock(returncode=0, stdout=b'p10\nfcwd\nn/Users/a/REPOS/app\nf3\nn*:22\nn/Users/a/log.txt\n', stderr=b'')
+        ps = Mock(returncode=0, stdout=b'/usr/bin/python3 /Users/a/job/run.py --out=/Users/a/out dir\n', stderr=b'')
+        found, error, calls = self.read_darwin_references(lsof, ps)
+        self.assertIsNone(error)
+        for expected in ('/Users/a/REPOS/app', '/Users/a/log.txt', '/Users/a/job/run.py', '/Users/a/out', '/Users/a/out dir'):
+            self.assertIn(expected, found)
+        self.assertNotIn('*:22', found)
+        self.assertEqual([call.args[0][:3] for call in calls.call_args_list],
+                         [['sudo', '-n', 'lsof'], ['sudo', '-n', 'ps']])
+
+    def test_darwin_inventory_rejects_failed_lsof_or_ps(self):
+        good = Mock(returncode=0, stdout=b'', stderr=b'')
+        for lsof, ps in ((Mock(returncode=1, stdout=b'', stderr=b'lsof: denied'), good),
+                         (good, Mock(returncode=1, stdout=b'', stderr=b'ps: denied'))):
+            with self.subTest(failed=lsof.returncode or ps.returncode):
+                found, error, _ = self.read_darwin_references(lsof, ps)
+                self.assertIsNone(found)
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn('process-use inventory incomplete', str(error))
+
+    def test_darwin_inventory_protects_mounts_lsof_could_not_stat(self):
+        warning = (b"lsof: WARNING: can't stat() smbfs file system /Volumes/share\n"
+                   b'      Output information may be incomplete.\n'
+                   b'      assuming "dev=1000004" from mount table\n')
+        found, error, _ = self.read_darwin_references(
+            Mock(returncode=0, stdout=b'n/Users/a/x\n', stderr=warning), Mock(returncode=0, stdout=b'', stderr=b''))
+        self.assertIsNone(error)
+        self.assertIn('/Volumes/share', found)
+        self.assertIn('/Users/a/x', found)
+
+    def test_darwin_inventory_rejects_unrecognised_lsof_diagnostics(self):
+        for stderr in (b'lsof: WARNING: something else\n',
+                       b'      Output information may be incomplete.\n'):
+            with self.subTest(stderr=stderr):
+                found, error, _ = self.read_darwin_references(
+                    Mock(returncode=0, stdout=b'n/Users/a/x\n', stderr=stderr),
+                    Mock(returncode=0, stdout=b'', stderr=b''))
+                self.assertIsNone(found)
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn('process-use inventory incomplete', str(error))
+
+    def test_darwin_inventory_decodes_escaped_lsof_filenames(self):
+        found, error, _ = self.read_darwin_references(
+            Mock(returncode=0, stdout='n/Users/a/\\xe9\\x9b\\xaa/open.txt\n'.encode(), stderr=b''),
+            Mock(returncode=0, stdout=b'', stderr=b''))
+        self.assertIsNone(error)
+        self.assertIn('/Users/a/\u96ea/open.txt', found)
+        self.assertIn('/Users/a/\\xe9\\x9b\\xaa/open.txt', found)
+
+    def inventory_failure(self, platform, run):
+        with patch.object(reclaim_probe.sys, 'platform', platform), patch.object(
+                reclaim_probe.os, 'geteuid', return_value=1000), patch.object(
+                reclaim_probe.subprocess, 'run', side_effect=run):
+            error = self.failure(self.read_references)
+        return type(error), str(error)
+
+    def test_inventory_without_passwordless_sudo_is_a_skip_naming_the_readme(self):
+        expected = (ValueError, 'IN USE: process inventory needs passwordless sudo (see README#sudo)')
+        for platform, encode in (('linux', str), ('darwin', str.encode)):
+            for stderr in ('sudo: a password is required\n', 'sudo: sorry, user alice is not allowed to execute x\n',
+                           'sudo: unable to send audit message: Operation not permitted\nsudo: a password is required\n'):
+                refused = Mock(returncode=1, stdout=encode(''), stderr=encode(stderr))
+                with self.subTest(platform=platform, stderr=stderr):
+                    self.assertEqual(self.inventory_failure(platform, lambda *args, **kwargs: refused), expected)
+            with self.subTest(platform=platform, sudo='missing'):
+                self.assertEqual(self.inventory_failure(platform, FileNotFoundError(2, 'No such file', 'sudo')), expected)
+        broken = Mock(returncode=1, stdout='', stderr='sudo: python3: command not found\n')
+        self.assertIs(self.inventory_failure('linux', lambda *args, **kwargs: broken)[0], RuntimeError)
+
+    @unittest.skipIf(os.geteuid() == 0, 'root reads mode 000 directories')
+    def test_unreadable_proc_is_a_one_line_skip(self):
+        process = self.root / 'proc/1'; (process / 'fd').mkdir(parents=True)
+        (process / 'cmdline').write_bytes(b'init\0'); (process / 'environ').write_bytes(b'')
+        (process / 'fd').chmod(0); self.addCleanup((process / 'fd').chmod, 0o700)
+        with patch.object(reclaim_probe.os, 'geteuid', return_value=0):
+            error = self.failure(lambda: self.read_references(str(self.root / 'proc')))
+        self.assertEqual((type(error), str(error)), (ValueError, 'process inventory incomplete: /proc not readable'))
+
+    def test_narrow_sudoers_rule_runs_the_installed_scan(self):
+        installed = self.root / 'coldcleaner-proc-scan.py'
+        calls = []
+        def run(command, **kwargs):
+            calls.append(command)
+            return Mock(returncode=0, stdout='[]', stderr='')
+        with patch.object(reclaim_probe, 'SCAN_PATH', str(installed), create=True), patch.object(
+                reclaim_probe.os, 'geteuid', return_value=1000), patch.object(
+                reclaim_probe.subprocess, 'run', side_effect=run):
+            installed.write_text(reclaim_probe.PROC_SCAN + '\n# older release\n')
+            self.read_references()
+            installed.write_text(reclaim_probe.PROC_SCAN)
+            self.read_references()
+        self.assertEqual(calls, [['sudo', '-n', 'python3', '-c', reclaim_probe.PROC_SCAN, '/proc'],
+                                 ['sudo', '-n', 'python3', '-I', str(installed), '/proc']])
+        readme = (Path(__file__).parents[1] / 'README.md').read_text()
+        self.assertIn('\n## Sudo\n', readme)
+        self.assertIn('NOPASSWD: /usr/bin/python3 -I /usr/local/libexec/coldcleaner-proc-scan.py /proc\n', readme)
 
     def read_windows_references(self, rows, protected, gone=()):
         with patch.object(reclaim_probe.os, 'name', 'nt'), patch.object(
@@ -1192,6 +1406,91 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(os.getxattr(source / 'unique', 'user.coldcleaner-test'), b'private metadata')
         self.assertFalse((self.root / 'nas').exists())
 
+    def without_os_listxattr(self, platform):
+        saved = os.listxattr
+        del os.listxattr
+        self.addCleanup(setattr, os, 'listxattr', saved)
+        mock = patch.object(sys, 'platform', platform)
+        mock.start(); self.addCleanup(mock.stop)
+
+    def darwin_libc(self, attributes):
+        self.without_os_listxattr('darwin')
+        calls = []
+        def listxattr(path, names, size, options):
+            calls.append((names, size, options))
+            listing = b''.join(name + b'\0' for name in attributes.get(Path(os.fsdecode(path)).name, []))
+            if names is not None:
+                ctypes.memmove(names, listing, len(listing))
+            return len(listing)
+        mock = patch.object(ctypes, 'CDLL', return_value=Mock(listxattr=listxattr))
+        mock.start(); self.addCleanup(mock.stop)
+        return calls
+
+    def archive_rows(self, source):
+        self.config['hosts']['test']['archive'] = [str(source)]
+        self.engine.archives()
+        return [row for row in self.entry.actions if row['path'] == str(source)]
+
+    def test_macos_tree_without_os_listxattr_reads_attributes_through_libc(self):
+        source = self.root / 'evidence'; source.mkdir(); (source / 'clean').write_text('keep')
+        stamp = time.time() - 8 * 86400
+        for path in (source / 'clean', source):
+            os.utime(path, (stamp, stamp))
+        calls = self.darwin_libc({})
+        rows = self.archive_rows(source)
+        self.assertEqual([row['action'] for row in rows], ['would archive and remove'], rows)
+        self.assertEqual(set(calls), {(None, 0, 1)})
+
+    def test_macos_attributes_read_through_libc_still_retain_the_source(self):
+        source = self.root / 'evidence'; source.mkdir(); (source / 'tagged').write_text('keep')
+        self.darwin_libc({'tagged': [b'com.apple.FinderInfo']})
+        rows = self.archive_rows(source)
+        self.assertEqual([row['action'] for row in rows], ['skip'], rows)
+        self.assertIn('access metadata requires separate preservation', rows[0]['reason'])
+        self.assertTrue((source / 'tagged').exists())
+
+    def test_macos_libc_names_allow_only_provenance_and_quarantine_stamps(self):
+        source = self.root / 'evidence'; source.mkdir()
+        for name in ('stamped', 'tagged'):
+            (source / name).write_text('keep')
+        stamp = time.time() - 8 * 86400
+        for path in (*source.iterdir(), source):
+            os.utime(path, (stamp, stamp))
+        stamps = [b'com.apple.provenance', b'com.apple.quarantine']
+        attributes = {'evidence': stamps[:1], 'stamped': stamps, 'tagged': stamps[1:]}
+        self.darwin_libc(attributes)
+        self.assertEqual([row['action'] for row in self.archive_rows(source)], ['would archive and remove'])
+        attributes['tagged'] = [*stamps, b'com.apple.metadata:kMDItemWhereFroms']
+        rows = self.archive_rows(source)
+        self.assertEqual([row['action'] for row in rows], ['would archive and remove', 'skip'], rows)
+        self.assertIn('access metadata requires separate preservation: ' + str(source / 'tagged'), rows[-1]['reason'])
+
+    def test_worktree_with_only_provenance_xattrs_passes_but_any_other_xattr_skips(self):
+        repo, work = self.worktree()
+        def provenance(extra):
+            def listxattr(path, follow_symlinks=True):
+                inside = Path(path) == work or work in Path(path).parents
+                return ['com.apple.provenance', *extra.get(Path(path).name, [])] if inside else []
+            return patch.object(os, 'listxattr', side_effect=listxattr)
+        with patch.object(protect, 'collect', return_value=self.protection):
+            with provenance({}):
+                self.engine.worktrees()
+            self.assertEqual(self.entry.actions[-1]['action'], 'would remove worktree', self.entry.actions[-1])
+            with provenance({'tracked': ['user.private']}):
+                self.engine.worktrees()
+        self.assertEqual(self.entry.actions[-1]['action'], 'skip', self.entry.actions[-1])
+        self.assertIn('access metadata requires separate preservation: ' + str(work / 'tracked'),
+                      self.entry.actions[-1]['reason'])
+        self.assertTrue((work / 'tracked').exists())
+
+    def test_unreadable_attributes_skip_the_source_instead_of_guessing(self):
+        source = self.root / 'evidence'; source.mkdir(); (source / 'unique').write_text('keep')
+        self.without_os_listxattr('sunos5')
+        rows = self.archive_rows(source)
+        self.assertEqual([row['action'] for row in rows], ['skip'], rows)
+        self.assertIn('extended attributes cannot be read', rows[0]['reason'])
+        self.assertTrue((source / 'unique').exists())
+
     def test_guard_rejects_filesystem_root_and_home(self):
         home = self.root / 'home'; home.mkdir()
         with patch.dict(os.environ, HOME=str(home)), patch.object(reclaim_probe, 'threads', return_value=[]), \
@@ -1243,6 +1542,62 @@ class ReclaimTests(unittest.TestCase):
         (directory / 'statev2.sqlite').write_bytes(b'invalid')
         with self.assertRaises(sqlite3.DatabaseError):
             self.read_threads()
+
+    def test_host_without_t3_notes_it_once(self):
+        with patch.object(reclaim_probe, 'threads', self.read_threads):
+            actions, _ = self.archive_preview()
+        self.assertEqual([action for _, action, _ in actions], ['skip', 'would archive and remove', 'would archive and remove'])
+        self.assertEqual(self.entry.notes.count('T3 not installed'), 1)
+        self.assertEqual(report.render([self.entry]).count('T3 not installed'), 1)
+
+    def test_renamed_t3_tables_protect_every_candidate_with_one_reason(self):
+        directory = self.root / '.t3/userdata'; directory.mkdir(parents=True)
+        with closing(sqlite3.connect(directory / 'statev2.sqlite')) as db:
+            db.executescript('''CREATE TABLE orchestration_v3_projection_threads(thread_id,deleted_at,archived_at,payload_json);
+                CREATE TABLE orchestration_v3_projection_runs(thread_id,status);
+                CREATE TABLE projection_projects(project_id,workspace_root);''')
+        with patch.object(reclaim_probe, 'threads', self.read_threads):
+            actions, _ = self.archive_preview()
+        self.assertEqual([action for _, action, _ in actions], ['skip'] * 3)
+        reasons = {reason for _, _, reason in actions}
+        self.assertEqual(len(reasons), 1, reasons)
+        reason = reasons.pop()
+        self.assertEqual(reason, 'IN USE: T3 state unreadable, protecting every candidate: '
+                                 'OperationalError: no such table: orchestration_v2_projection_threads')
+        self.assertEqual(self.entry.errors, [])
+        self.assertEqual(self.entry.notes, [reason])
+        self.assertTrue((self.root / 'old' / 'data').exists())
+
+    def codex_state(self, rows, columns='id, cwd, archived, updated_at'):
+        directory = self.root / '.codex'; directory.mkdir(exist_ok=True)
+        (directory / 'state_4.sqlite').write_bytes(b'stale version is ignored')
+        with closing(sqlite3.connect(directory / 'state_5.sqlite')) as db:
+            db.execute(f'CREATE TABLE threads({columns})')
+            db.executemany('INSERT INTO threads VALUES(?,?,?,?)', rows)
+            db.commit()
+
+    def test_codex_threads_protect_recent_unarchived_workspaces(self):
+        now = int(time.time())
+        recent, archived, idle, broad = (self.root / name for name in ('recent', 'archived', 'idle', 'broad'))
+        for folder in (recent, archived, idle, broad):
+            folder.mkdir(); (folder / 'data').write_text('x')
+            os.utime(folder / 'data', (now - 30 * 86400,) * 2); os.utime(folder, (now - 30 * 86400,) * 2)
+        self.codex_state([('a', str(recent / 'sub'), 0, now - 3600), ('b', str(archived), 1, now),
+                          ('c', str(idle), 0, now - 10 * 86400), ('d', str(self.root), 0, now)])
+        with patch.object(reclaim_probe, 'codex_threads', self.read_codex), patch.object(reclaim_probe, 'threads', self.read_threads):
+            with self.assertRaisesRegex(ValueError, '^Codex thread uses ' + re.escape(str(recent / 'sub')) + '$'):
+                reclaim_probe.main(dict(operation='guard', path=str(recent), days=7))
+            for folder in (archived, idle, broad):
+                with self.subTest(folder=folder.name):
+                    self.assertEqual(reclaim_probe.main(dict(operation='guard', path=str(folder), days=7))['files'], 1)
+
+    def test_codex_schema_change_protects_every_candidate(self):
+        self.codex_state([('a', str(self.root / 'elsewhere'), 0, 0)], columns='id, working_dir, archived, updated_at')
+        (self.root / 'old').mkdir()
+        with patch.object(reclaim_probe, 'codex_threads', self.read_codex):
+            with self.assertRaisesRegex(ValueError, '^IN USE: Codex state unreadable, protecting every candidate: '
+                                                    'OperationalError: no such column: cwd$'):
+                reclaim_probe.main(dict(operation='guard', path=str(self.root / 'old')))
 
     def run_json(self, apply=False):
         stdout, stderr = io.StringIO(), io.StringIO()

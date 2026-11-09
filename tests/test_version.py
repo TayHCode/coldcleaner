@@ -1,17 +1,65 @@
 import contextlib
 import io
 import subprocess
+import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from coldcleaner import cli, disk, hosts, protect, report, rules, version
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 def run(path, *args):
     subprocess.run(['git', '-C', str(path), '-c', 'user.name=t', '-c', 'user.email=t@t', *args],
                    check=True, capture_output=True)
+
+
+def version_flag():
+    output, errors = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+        try:
+            cli.main(['--version'])
+        except SystemExit as exc:
+            return exc.code, output.getvalue(), errors.getvalue()
+    return None, output.getvalue(), errors.getvalue()
+
+
+class VersionFlagCase(unittest.TestCase):
+    def test_module_prints_pyproject_version(self):
+        expected = tomllib.loads((ROOT / 'pyproject.toml').read_text(encoding='utf-8'))['project']['version']
+        result = subprocess.run([sys.executable, '-m', 'coldcleaner', '--version'], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, f'coldcleaner {expected}\n', ''))
+
+    def test_installed_copy_prints_package_version(self):
+        with tempfile.TemporaryDirectory() as empty, patch.object(version, 'CHECKOUT', Path(empty)), \
+                patch('importlib.metadata.version', return_value='9.8.7') as lookup:
+            self.assertEqual(version_flag(), (0, 'coldcleaner 9.8.7\n', ''))
+        lookup.assert_called_once_with('coldcleaner')
+
+    def test_unknown_version_fails(self):
+        with tempfile.TemporaryDirectory() as empty, patch.object(version, 'CHECKOUT', Path(empty)), \
+                patch('importlib.metadata.version', side_effect=version.importlib.metadata.PackageNotFoundError('coldcleaner')):
+            code, output, errors = version_flag()
+        self.assertEqual((code, output), (1, ''))
+        self.assertIn('coldcleaner: version unknown', errors)
+
+    def test_unreadable_pyproject_fails_instead_of_guessing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'pyproject.toml').write_text('[project]\nname = "coldcleaner"\nversion = \n')
+            with patch.object(version, 'CHECKOUT', Path(folder)), patch('importlib.metadata.version', return_value='9.8.7'):
+                code, output, errors = version_flag()
+        self.assertEqual((code, output), (1, ''))
+        self.assertIn('coldcleaner: version unknown', errors)
+
+    def test_other_projects_pyproject_is_ignored(self):
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / 'pyproject.toml').write_text('[project]\nname = "other"\nversion = "1.0"\n')
+            with patch.object(version, 'CHECKOUT', Path(folder)), patch('importlib.metadata.version', return_value='9.8.7'):
+                self.assertEqual(version_flag(), (0, 'coldcleaner 9.8.7\n', ''))
 
 
 class VersionCase(unittest.TestCase):

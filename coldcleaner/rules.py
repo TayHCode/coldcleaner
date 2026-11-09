@@ -6,6 +6,7 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 from . import hosts
+from .reclaim_probe import CACHE_TOOLS
 
 TIERS = ('cache', 'github', 'worktree', 'archive', 'project', 'compact')
 def default_path(checkout=Path(__file__).resolve().parent.parent):
@@ -22,9 +23,14 @@ TOP_LEVEL_KEYS = frozenset({
     'worktree_idle_days', 'archive_idle_days',
     'project_idle_days', 'nas_cap_gb', 'nas_root', 'local_archive_mount', 'report_dir',
     'compact_weekday', 'live', 'regenerable_paths',
-    'already_compressed_extensions', 'hosts', 'reclaim_hosts',
+    'already_compressed_extensions', 'hosts', 'reclaim_hosts', 'actions_log_mb', 'manual_notes',
 })
-HOST_KEYS = frozenset({'roots', 'archive', 'compact', 'cache', 'shared_roots', 'kind', 'ssh', 'distro'})
+REQUIRED_KEYS = (
+    'hard_pct', 'alert_pct', 'worktree_idle_days', 'archive_idle_days', 'project_idle_days',
+    'nas_cap_gb', 'compact_weekday', 'live', 'nas_root', 'report_dir',
+    'already_compressed_extensions', 'hosts',
+)
+HOST_KEYS = frozenset({'roots', 'archive', 'compact', 'cache', 'cache_tools', 'shared_roots', 'kind', 'ssh', 'distro'})
 CACHE_KEYS = frozenset({'path', 'command', 'days', 'owner', 'runner', 'failed_days', 'clone'})
 USERNAME = re.compile(r'[A-Za-z0-9._-]+')
 WINDOWS_TEMP_FOLDERS = (
@@ -44,6 +50,9 @@ def load(path=DEFAULT_PATH):
     unknown = set(data) - TOP_LEVEL_KEYS
     if unknown:
         raise ValueError(f'unknown rules option: {sorted(unknown)[0]}; known options: {", ".join(sorted(TOP_LEVEL_KEYS))}')
+    missing = [key for key in REQUIRED_KEYS if key not in data]
+    if missing:
+        raise ValueError(f'missing required key {missing[0]}')
     for key in ('hard_pct', 'alert_pct'):
         if type(data.get(key)) is not int or not 0 < data[key] <= 100:
             raise ValueError(f'{key} must be an integer from 1 through 100, got {data.get(key)!r}')
@@ -55,6 +64,8 @@ def load(path=DEFAULT_PATH):
             raise ValueError(f'{key} must be a non-negative finite number, got {value!r}')
     if type(data.get('nas_cap_gb')) is not int or data['nas_cap_gb'] < 1:
         raise ValueError(f"nas_cap_gb must be a positive integer, got {data.get('nas_cap_gb')!r}")
+    if 'actions_log_mb' in data and (type(data['actions_log_mb']) is not int or data['actions_log_mb'] < 1):
+        raise ValueError(f"actions_log_mb must be a positive integer, got {data['actions_log_mb']!r}")
     if data.get('compact_weekday') not in ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'):
         raise ValueError(f"compact_weekday must be one of mon, tue, wed, thu, fri, sat, sun, got {data.get('compact_weekday')!r}")
     live = data.get('live')
@@ -66,9 +77,9 @@ def load(path=DEFAULT_PATH):
         if tier in live[:index]:
             raise ValueError(f'live[{index}]: repeated tier: {tier!r}')
     output_paths = {key: data.get(key) for key in ('nas_root', 'report_dir')}
-    if isinstance(data.get('report_dir'), str):
-        data['report_dir'] = str(Path(data['report_dir']).expanduser())
     for key in ('nas_root', 'report_dir'):
+        if isinstance(data.get(key), str):
+            data[key] = str(Path(data[key]).expanduser())
         if not isinstance(data.get(key), str) or not Path(data[key]).is_absolute():
             raise ValueError(f'{key} must be absolute, got {data.get(key)!r}')
         if any(c in data[key] for c in '*?['):
@@ -87,7 +98,7 @@ def load(path=DEFAULT_PATH):
                 or '..' in mount.replace('\\', '/').split('/') or root_or_home(mount):
             raise ValueError(f'local_archive_mount must be an absolute mount point, not a root, home or glob path, got {mount!r}')
         if not PurePosixPath(data['nas_root']).is_relative_to(PurePosixPath(mount)):
-            raise ValueError(f"nas_root must be inside local_archive_mount, got {data['nas_root']!r} outside {mount!r}")
+            raise ValueError(f"nas_root must be inside local_archive_mount, got {output_paths['nas_root']!r} outside {mount!r}")
     regenerable = data.get('regenerable_paths', [])
     if not isinstance(regenerable, list):
         raise ValueError(f'regenerable_paths must be an array, got {regenerable!r}')
@@ -96,6 +107,14 @@ def load(path=DEFAULT_PATH):
             raise ValueError(f'regenerable_paths[{index}]: not an explicit project-relative directory path: {path!r}')
         if path in regenerable[:index]:
             raise ValueError(f'regenerable_paths[{index}]: repeated path: {path!r}')
+    notes = data.get('manual_notes', [])
+    if not isinstance(notes, list):
+        raise ValueError(f'manual_notes must be an array of strings, got {notes!r}')
+    for index, note in enumerate(notes):
+        if not isinstance(note, str) or not note.strip() or has_control(note):
+            raise ValueError(f'manual_notes[{index}]: not a nonempty single-line string: {note!r}')
+        if note in notes[:index]:
+            raise ValueError(f'manual_notes[{index}]: repeated note: {note!r}')
     extensions = data.get('already_compressed_extensions')
     if not isinstance(extensions, list):
         raise ValueError(f'already_compressed_extensions must be an array, got {extensions!r}')
@@ -143,6 +162,16 @@ def load(path=DEFAULT_PATH):
                     raise ValueError(f'{name}.{key}[{index}]: shared roots must not contain globs')
                 if path_key(path) in [path_key(earlier) for earlier in paths[:index]]:
                     raise ValueError(f'{name}.{key}[{index}]: repeated path: {path!r}')
+        tools = config.get('cache_tools', [])
+        if not isinstance(tools, list):
+            raise ValueError(f'{name}.cache_tools must be an array, got {tools!r}')
+        for index, tool in enumerate(tools):
+            if not isinstance(tool, str) or tool not in CACHE_TOOLS:
+                raise ValueError(f'{name}.cache_tools[{index}]: unknown tool {tool!r}; known tools: {", ".join(CACHE_TOOLS)}')
+            if tool in tools[:index]:
+                raise ValueError(f'{name}.cache_tools[{index}]: repeated tool: {tool!r}')
+        if tools and kind != 'posix':
+            raise ValueError(f'{name}.cache_tools needs a POSIX host, got kind {kind!r}')
         caches = config.get('cache', [])
         if not isinstance(caches, list):
             raise ValueError(f'{name}.cache must be an array, got {caches!r}')

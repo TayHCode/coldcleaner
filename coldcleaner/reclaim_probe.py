@@ -6,12 +6,20 @@ import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
 import tarfile
 import time
+
+
+def sha256_hex(stream):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def windows_file_safety(path):
@@ -92,7 +100,7 @@ def threads():
     root = Path.home() / '.t3/userdata'
     database = root / 'statev2.sqlite'
     if not root.exists():
-        return []
+        return None
     with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=10)) as db:
         rows = db.execute('''SELECT t.payload_json, t.archived_at, EXISTS
               (SELECT 1 FROM orchestration_v2_projection_runs r WHERE r.thread_id=t.thread_id
@@ -114,6 +122,41 @@ def threads():
                     if project:
                         paths.append(project[0])
         return paths
+
+
+def codex_threads():
+    root = Path.home() / '.codex'
+    if not root.exists():
+        return None
+    databases = sorted(root.glob('state_*.sqlite'), key=lambda database: int(database.stem.removeprefix('state_')))
+    if not databases:
+        raise ValueError('no state_*.sqlite in ' + str(root))
+    with closing(sqlite3.connect(databases[-1].as_uri() + '?mode=ro', uri=True, timeout=10)) as db:
+        rows = db.execute('SELECT cwd, MAX(updated_at) FROM threads WHERE archived = 0 GROUP BY cwd').fetchall()
+    broad = {os.path.normcase(str(Path.home())), os.path.normcase(os.path.abspath(os.sep))}
+    if not all(isinstance(cwd, str) and isinstance(updated, int) for cwd, updated in rows):
+        raise ValueError('unexpected threads.cwd or threads.updated_at type')
+    return [(cwd, updated) for cwd, updated in rows if os.path.normcase(os.path.abspath(cwd)) not in broad]
+
+
+def t3_threads():
+    found = threads()
+    return None if found is None else [(path, None) for path in found]
+
+
+def workspaces():
+    found, notes, blocked = [], [], []
+    for name, detect in (('T3', t3_threads), ('Codex', codex_threads)):
+        try:
+            result = detect()
+        except Exception as error:
+            blocked.append(f'IN USE: {name} state unreadable, protecting every candidate: {type(error).__name__}: {error}')
+            continue
+        if result is None:
+            notes.append(f'{name} not installed')
+        else:
+            found.extend([name, path, updated] for path, updated in result)
+    return dict(threads=found, notes=notes, blocked=blocked)
 
 
 def windows_arguments(command):
@@ -292,6 +335,8 @@ for proc in Path(sys.argv[1]).iterdir():
             if exited(proc) or kernel_thread(proc):
                 continue
             sys.exit('process ' + proc.name + ' is running but its files are unreadable')
+    except PermissionError:
+        sys.exit('/proc not readable')
     paths.extend(found)
 print(json.dumps(list(namespaces.values()) if by_namespace else paths))
 """
@@ -340,7 +385,63 @@ def wsl_references():
     return paths
 
 
+SCAN_PATH = '/usr/local/libexec/coldcleaner-proc-scan.py'
+NEEDS_SUDO = 'IN USE: process inventory needs passwordless sudo (see README#sudo)'
+SUDO_REFUSED = re.compile(r'^sudo: (a password is required|sorry, user .* is not allowed)', re.M)
+
+
+def sudo_run(command, **kwargs):
+    sudo = [] if os.geteuid() == 0 else ['sudo', '-n']
+    try:
+        result = subprocess.run(sudo + command, capture_output=True, **kwargs)
+    except FileNotFoundError:
+        if sudo:
+            raise ValueError(NEEDS_SUDO) from None
+        raise
+    stderr = result.stderr if isinstance(result.stderr, str) else os.fsdecode(result.stderr)
+    if sudo and result.returncode and SUDO_REFUSED.search(stderr):
+        raise ValueError(NEEDS_SUDO)
+    return result
+
+
+def installed_scan():
+    try:
+        return Path(SCAN_PATH).read_text() == PROC_SCAN
+    except OSError:
+        return False
+
+
+def darwin_references():
+    def capture(command):
+        result = sudo_run(command)
+        if result.returncode:
+            raise RuntimeError('process-use inventory incomplete: ' + command[0] + ': '
+                               + result.stderr.decode(errors='replace').strip())
+        return result
+
+    lsof = capture(['lsof', '-nP', '-Fn'])
+    paths = []
+    for line in os.fsdecode(lsof.stderr).splitlines():
+        warning = re.fullmatch(r"lsof: WARNING: can't stat\(\) \S+ file system (/.+)", line)
+        if warning:
+            paths.append(warning[1])
+        elif not (paths and (line.strip() == 'Output information may be incomplete.'
+                             or re.fullmatch(r'\s+assuming "dev=[0-9]+" from mount table', line))):
+            raise RuntimeError('process-use inventory incomplete: lsof: ' + line)
+    for line in lsof.stdout.splitlines():
+        if line.startswith(b'n/'):
+            name = os.fsdecode(line[1:])
+            decoded = os.fsdecode(re.sub(rb"\\x([0-9a-fA-F]{2})", lambda match: bytes([int(match[1], 16)]), line[1:]))
+            paths.extend({name, decoded})
+    for line in os.fsdecode(capture(['ps', '-axww', '-o', 'command=']).stdout).splitlines():
+        paths.extend(re.findall(r"/[^\x00:=\x27\x22;,|()<>]+", line))
+        paths.extend(re.findall(r"/[^\s\x00:=\x27\x22;,|()<>]+", line))
+    return paths
+
+
 def references(proc='/proc'):
+    if sys.platform == 'darwin':
+        return darwin_references()
     if os.name == 'nt':
         script = "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
         result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
@@ -371,10 +472,10 @@ def references(proc='/proc'):
         if 'vmmemWSL' in machines:
             paths.extend(wsl_references())
         return paths + drivers()
-    command = ['python3', '-c', PROC_SCAN, str(proc)]
-    if os.geteuid() != 0:
-        command = ['sudo', '-n', *command]
-    result = subprocess.run(command, capture_output=True, text=True)
+    scan = ['-I', SCAN_PATH] if installed_scan() else ['-c', PROC_SCAN]
+    result = sudo_run(['python3', *scan, str(proc)], text=True)
+    if result.returncode and result.stderr.strip() == '/proc not readable':
+        raise ValueError('process inventory incomplete: /proc not readable')
     if result.returncode:
         raise RuntimeError('process-use inventory incomplete: ' + result.stderr.strip())
     return json.loads(result.stdout)
@@ -435,6 +536,194 @@ def reject_package_caches(root):
             continue
 
 
+CACHE_TOOLS = {
+    'uv': dict(names=('uv',), clean=('cache', 'prune'), where=('cache', 'dir'), running=r'uvx?'),
+    'npm': dict(names=('npm',), clean=('cache', 'clean', '--force'), where=('config', 'get', 'cache'),
+                inside='_cacache', running=r'np[mx](-cli\.js)?'),
+    'pnpm': dict(names=('pnpm',), clean=('store', 'prune'), where=('store', 'path'), running=r'pnp[mx](\.c?js)?'),
+    'pip': dict(names=('pip', 'pip3'), clean=('cache', 'purge'), where=('cache', 'dir'),
+                running=r'pip(3(\.\d+)?)?', module='pip'),
+    'brew': dict(names=('brew',), clean=('cleanup', '-s'), where=('--cache',), running=r'brew(\.sh|\.rb)?',
+                 env=dict(HOMEBREW_NO_AUTOREMOVE='1'), preview=('cleanup', '-n', '-s')),
+}
+TOOL_DIRS = ('~/.local/bin', '/opt/homebrew/bin', '/usr/local/bin')
+TOOL_SECONDS = 60
+CLEAN_SECONDS = 600
+
+
+def processes():
+    try:
+        result = subprocess.run(['ps', 'axww', '-o', 'pid=,command='], capture_output=True, timeout=TOOL_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError('process list unavailable: ' + str(error)) from None
+    if result.returncode:
+        raise RuntimeError('process list unavailable: ' + os.fsdecode(result.stderr).strip())
+    commands = []
+    for line in os.fsdecode(result.stdout).splitlines():
+        pid, _, command = line.strip().partition(' ')
+        if not pid.isdigit():
+            raise RuntimeError('process list unreadable: ' + line)
+        if int(pid) != os.getpid():
+            commands.append(command)
+    return commands
+
+
+def tool_running(spec, command):
+    words = command.split()
+    return (any(re.fullmatch(spec['running'], word.rsplit('/', 1)[-1]) for word in words)
+            or 'module' in spec and any(pair == ('-m', spec['module']) for pair in zip(words, words[1:])))
+
+
+def locate(tool, spec):
+    search = os.pathsep.join([os.environ.get('PATH', os.defpath), *(os.path.expanduser(d) for d in TOOL_DIRS)])
+    for name in spec['names']:
+        found = shutil.which(name, path=search)
+        if found:
+            return found, dict(os.environ, PATH=search, **spec.get('env', {}))
+    raise ValueError(tool + ' is not installed')
+
+
+def display(argv):
+    return ' '.join((Path(argv[0]).name, *argv[1:]))
+
+
+def tool_output(argv, env, seconds):
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        raise ValueError(display(argv) + ' timed out') from None
+    except OSError as error:
+        raise ValueError(display(argv) + ' failed: ' + str(error)) from None
+    if result.returncode:
+        raise ValueError(display(argv) + ' failed: ' + (result.stderr.strip().splitlines() or ['exit %d' % result.returncode])[-1])
+    return result.stdout
+
+
+def tool_cache(tool, spec, executable, env):
+    lines = tool_output([executable, *spec['where']], env, TOOL_SECONDS).strip().splitlines()
+    if len(lines) != 1:
+        raise ValueError(tool + ' reported no single cache location')
+    path = Path(lines[0].strip()) / spec.get('inside', '')
+    home = Path.home()
+    if not path.is_absolute() or '..' in path.parts or path == home or not path.is_relative_to(home):
+        raise ValueError(tool + ' cache location is not inside the home folder: ' + str(path))
+    for parent in (path, *path.parents):
+        if parent.is_symlink() or (parent / '.keep-local').exists():
+            raise ValueError('.keep-local or symlink ancestor: ' + str(parent))
+    if not path.is_dir():
+        raise ValueError('no ' + tool + ' cache at ' + str(path))
+    return str(path)
+
+
+def bounded(tool, spec, executable, env, path):
+    if 'preview' not in spec:
+        return
+    for line in tool_output([executable, *spec['preview']], env, TOOL_SECONDS).splitlines():
+        if not line.strip() or line.startswith('==> This operation would free approximately '):
+            continue
+        match = re.fullmatch(r'Would remove: (/.+) \([^()]*\)', line)
+        if not match:
+            raise ValueError(display([executable, *spec['preview']]) + ' output not understood: ' + line)
+        target = Path(match[1])
+        if '..' in target.parts or not target.is_relative_to(path):
+            raise ValueError(display([executable, *spec['clean']]) + ' would also remove ' + str(target) + ', outside its cache')
+
+
+def cache_tool(tool, commands, deadline):
+    spec = CACHE_TOOLS[tool]
+    row = dict(tool=tool, command=' '.join((tool, *spec['clean'])), path='', bytes=0, complete=True, skip='')
+    try:
+        executable, env = locate(tool, spec)
+        row['command'] = display([executable, *spec['clean']])
+        if any(tool_running(spec, command) for command in commands):
+            raise ValueError('IN USE: ' + tool + ' is running')
+        row['path'] = tool_cache(tool, spec, executable, env)
+        bounded(tool, spec, executable, env, row['path'])
+        row.update(measure(row['path'], deadline))
+    except ValueError as error:
+        row['skip'] = str(error)
+    return row
+
+
+def clean_cache(tool, path, seconds):
+    row = cache_tool(tool, processes(), time.monotonic() + seconds)
+    if row['skip']:
+        raise ValueError(row['skip'])
+    if row['path'] != path:
+        raise ValueError(tool + ' cache location changed to ' + row['path'])
+    spec = CACHE_TOOLS[tool]
+    executable, env = locate(tool, spec)
+    try:
+        tool_output([executable, *spec['clean']], env, CLEAN_SECONDS)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from None
+    return dict(before=row['bytes'], after=measure(path, time.monotonic() + seconds)['bytes'])
+
+
+OS_STAMP_XATTRS = frozenset(('com.apple.provenance', 'com.apple.quarantine'))
+
+
+def xattr_names(path):
+    if hasattr(os, 'listxattr'):
+        return os.listxattr(path, follow_symlinks=False)
+    if sys.platform != 'darwin':
+        raise ValueError('extended attributes cannot be read on this platform: ' + str(path))
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
+    libc.listxattr.restype = ctypes.c_ssize_t
+    def listed(names, size):
+        size = libc.listxattr(os.fsencode(path), names, size, 1)
+        if size < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(path))
+        return size
+    size = listed(None, 0)
+    if size == 0:
+        return []
+    names = ctypes.create_string_buffer(size)
+    size = listed(names, size)
+    return [os.fsdecode(name) for name in names.raw[:size].split(b'\0') if name]
+
+
+def has_xattrs_beyond_os_stamps(path):
+    return not OS_STAMP_XATTRS.issuperset(xattr_names(path))
+
+
+def allocation(info):
+    return getattr(info, 'st_blocks', (info.st_size + 511) // 512) * 512
+
+
+def measure(path, deadline):
+    try:
+        root = os.lstat(extended(path))
+    except FileNotFoundError:
+        return dict(bytes=0, complete=True)
+    except OSError:
+        return dict(bytes=0, complete=False)
+    total = allocation(root); complete = True
+    pending = [extended(path)] if stat.S_ISDIR(root.st_mode) and not getattr(root, 'st_file_attributes', 0) & 1024 else []
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        return dict(bytes=total, complete=False)
+                    try:
+                        info = os.lstat(entry.path) if entry.is_dir(follow_symlinks=False) else entry.stat(follow_symlinks=False)
+                    except OSError:
+                        complete = False
+                        continue
+                    if stat.S_ISDIR(info.st_mode):
+                        if info.st_dev != root.st_dev or getattr(info, 'st_file_attributes', 0) & 1024:
+                            continue
+                        pending.append(entry.path)
+                    total += allocation(info)
+        except OSError:
+            complete = False
+    return dict(bytes=total, complete=complete)
+
+
 def tree(path, hashes=False):
     present(path)
     path = Path(path)
@@ -451,7 +740,7 @@ def tree(path, hashes=False):
         info = item.lstat()
         if info.st_dev != device:
             raise ValueError('filesystem boundary: ' + str(item))
-        if os.name != 'nt' and (os.listxattr(item, follow_symlinks=False) or
+        if os.name != 'nt' and (has_xattrs_beyond_os_stamps(item) or
                 info.st_uid != os.geteuid() or info.st_gid != os.getegid() or info.st_mode & 0o7000):
             raise ValueError('access metadata requires separate preservation: ' + str(item))
         if item.suffix.casefold() in ('.vhd', '.vhdx', '.qcow2', '.vmdk', '.vdi'):
@@ -463,7 +752,7 @@ def tree(path, hashes=False):
         if item.name == '.keep-local':
             raise ValueError('.keep-local: ' + str(item))
         newest = max(newest, info.st_mtime)
-        allocated += getattr(info, 'st_blocks', (info.st_size + 511) // 512) * 512
+        allocated += allocation(info)
         relative = str(item.relative_to(path.parent)).replace(os.sep, '/')
         if hashes:
             security[relative] = (windows_security(item) if os.name == 'nt' else
@@ -479,7 +768,7 @@ def tree(path, hashes=False):
             logical += info.st_size; files += 1
             if hashes:
                 with item.open('rb') as stream:
-                    result[relative] = hashlib.file_digest(stream, 'sha256').hexdigest()
+                    result[relative] = sha256_hex(stream)
         else:
             raise ValueError('special file: ' + str(item))
     return dict(bytes=allocated, logical_bytes=logical, files=files, newest=newest, manifest=result, security=security)
@@ -498,10 +787,15 @@ def guard(path, days=0, activity=None):
     for parent in (path, *path.parents):
         if parent.is_symlink() or getattr(parent.lstat(), 'st_file_attributes', 0) & 1024 or (parent / '.keep-local').exists():
             raise ValueError('.keep-local or symlink ancestor: ' + str(parent))
-    for reference in activity['threads'] if activity is not None else threads():
-        if overlap(path, reference):
-            raise ValueError('T3 thread uses ' + reference)
-    for reference in activity['references'] if activity is not None else references():
+    if activity is None:
+        activity = workspaces()
+        if activity['blocked']:
+            raise ValueError('; '.join(activity['blocked']))
+        activity['references'] = references()
+    for name, reference, updated in activity['threads']:
+        if (updated is None or updated > time.time() - days * 86400) and overlap(path, reference):
+            raise ValueError(f'{name} thread uses {reference}')
+    for reference in activity['references']:
         reference = os.path.normcase(os.path.realpath(reference))
         normalized = os.path.normcase(os.path.realpath(path))
         if reference.startswith(normalized.rstrip(os.sep) + os.sep) or reference == normalized:
@@ -663,10 +957,19 @@ def main(request):
                     found.append(path + base[len(root):])
                 dirs[:] = [name for name in dirs if name != '.git']
         return found
+    if op == 'cache-tools':
+        commands = processes()
+        deadline = time.monotonic() + request['seconds']
+        return [cache_tool(tool, commands, deadline) for tool in request['tools']]
+    if op == 'cache-clean':
+        return clean_cache(request['tool'], path, request['seconds'])
+    if op == 'sizes':
+        deadline = time.monotonic() + request['seconds']
+        return [measure(item, deadline) for item in request['paths']]
     if op == 'guard':
         return guard(path, request.get('days', 0), request.get('activity'))
     if op == 'activity':
-        return dict(threads=threads(), references=references())
+        return dict(**workspaces(), references=references())
     if op == 'manifest':
         return tree(path, True)
     if op == 'bundle':
@@ -676,7 +979,7 @@ def main(request):
             bundle = Path(directory) / 'head.bundle'
             git(path, 'bundle', 'create', str(bundle), 'HEAD')
             with bundle.open('rb') as stream:
-                print(json.dumps(dict(sha256=hashlib.file_digest(stream, 'sha256').hexdigest())), flush=True)
+                print(json.dumps(dict(sha256=sha256_hex(stream))), flush=True)
             with bundle.open('rb') as stream:
                 shutil.copyfileobj(stream, sys.stdout.buffer)
         return None
@@ -692,7 +995,7 @@ def main(request):
             with bundle.open('xb') as output:
                 shutil.copyfileobj(sys.stdin.buffer, output)
             with bundle.open('rb') as stream:
-                if hashlib.file_digest(stream, 'sha256').hexdigest() != request['sha256']:
+                if sha256_hex(stream) != request['sha256']:
                     raise ValueError('Git recovery bundle SHA-256 mismatch')
             pointer.unlink()
             git(path, 'init')

@@ -1,4 +1,6 @@
-"""Reclaim explicitly configured agent data without touching package caches."""
+"""Reclaim configured agent data; package caches only through their own tools' cleaners."""
+import fcntl
+import gzip
 import hashlib
 import json
 import ntpath
@@ -40,6 +42,7 @@ def probe(host, operation, **request):
 
 
 BATCH = 50
+SIZE_SECONDS = 30
 
 
 def repository(url):
@@ -170,7 +173,7 @@ def preserve(host, path, root, before_remove):
                     for member in archive:
                         if member.name in found or not (member.isdir() or member.isfile()):
                             raise ValueError('unexpected archive member')
-                        found[member.name.rstrip('/')] = (hashlib.file_digest(archive.extractfile(member), 'sha256').hexdigest()
+                        found[member.name.rstrip('/')] = (reclaim_probe.sha256_hex(archive.extractfile(member))
                                                           if member.isfile() else None)
                 if decompressor.wait():
                     raise RuntimeError('NAS archive test-read failed')
@@ -281,6 +284,27 @@ def package_cache(path):
     return reclaim_probe.package_cache(path)
 
 
+def blocked(reason):
+    if reason:
+        if 'incomplete' in reason or 'unavailable' in reason or 'timed out' in reason:
+            raise RuntimeError(reason)
+        raise ValueError(reason)
+
+
+def rotate_actions(live, now):
+    data = live.read_bytes()
+    packed = live.with_name(f'reclaim-actions-{now:%Y%m%dT%H%M%S%fZ}.jsonl.gz')
+    partial = packed.with_name(packed.name + '.partial')
+    with partial.open('xb') as stream:
+        stream.write(gzip.compress(data))
+        stream.flush(); os.fsync(stream.fileno())
+    if gzip.decompress(partial.read_bytes()) != data:
+        raise ValueError(f'rotated actions log {partial} does not read back')
+    os.link(partial, packed)
+    partial.unlink()
+    live.unlink()
+
+
 class Reclaimer:
     def __init__(self, host, config, apply, protection, report):
         self.host, self.config, self.apply = host, config, apply
@@ -289,7 +313,7 @@ class Reclaimer:
         if isinstance(self.protection, protect.Protection):
             self.protection.broad_paths.update(self.rules.get('shared_roots', []))
         self.listings = {}; self.prs = {}
-        self.checked = {}; self.activity = None; self.prefetched = {}
+        self.checked = {}; self.activity = None; self.prefetched = {}; self.unsized = []
 
     def archive_target(self, path, expected=None):
         if self.config.get('local_archive_mount') and self.host.ssh is not None:
@@ -309,15 +333,54 @@ class Reclaimer:
         if not final.is_file() or final.stat().st_size != record.archive_bytes:
             raise ValueError('verified archive is no longer present')
 
-    def log(self, tier, path, action, size=0, reason=''):
+    def log(self, tier, path, action, size=0, reason='', record=True):
         row = dict(tier=tier, path=path, action=action, bytes=size, reason=reason)
         self.report.actions.append(row)
+        if record:
+            self.record(row)
+        return row
+
+    def skip(self, tier, path, size, reason):
+        row = self.log(tier, path, 'skip', size, reason, record=bool(size))
+        if not size:
+            self.unsized.append(row)
+
+    def record(self, row):
         if self.apply:
             directory = Path(self.config['report_dir'])
             directory.mkdir(parents=True, exist_ok=True)
-            with (directory / 'reclaim-actions.jsonl').open('a') as stream:
-                stream.write(json.dumps(dict(host=self.host.name, at=datetime.now(timezone.utc).isoformat(), **row)) + '\n')
-                stream.flush(); os.fsync(stream.fileno())
+            now = datetime.now(timezone.utc)
+            line = json.dumps(dict(host=self.host.name, at=now.isoformat(), **row)) + '\n'
+            live = directory / 'reclaim-actions.jsonl'
+            with (directory / 'reclaim-actions.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if live.exists() and live.stat().st_size + len(line) > self.config.get('actions_log_mb', 10) * 1024 * 1024:
+                    rotate_actions(live, now)
+                with live.open('a') as stream:
+                    stream.write(line)
+                    stream.flush(); os.fsync(stream.fileno())
+
+    def size_skips(self):
+        rows, self.unsized = self.unsized, []
+        deadline = time.monotonic() + SIZE_SECONDS
+        partial = 0
+        try:
+            for start in range(0, len(rows), BATCH):
+                chunk = rows[start:start + BATCH]
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    partial += len(rows) - start
+                    break
+                for row, found in zip(chunk, probe(self.host, 'sizes', paths=[row['path'] for row in chunk], seconds=left)):
+                    row['bytes'] = found['bytes']
+                    partial += not found['complete']
+            if partial:
+                self.report.notes.append(f'{rows[0]["tier"]} skip sizes: {partial} are lower bounds (unreadable entries or the {SIZE_SECONDS}s cap)')
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            self.report.notes.append(f'{rows[0]["tier"]} skip sizes unavailable: {exc}')
+        finally:
+            for row in rows:
+                self.record(row)
 
     def proof(self, path, fresh=False):
         state = probe(self.host, 'repo', path=path)
@@ -344,9 +407,10 @@ class Reclaimer:
 
     def prefetch(self, candidates):
         try:
-            if self.activity is None:
-                self.activity = probe(self.host, 'activity')
+            self.load_activity()
         except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+            return
+        if self.activity['blocked']:
             return
         requests = [dict(operation=operation, path=path, **(dict(days=days) if operation == 'guard' else {}))
                     for path, days in candidates for operation in ('guard', 'context', 'repositories')]
@@ -359,6 +423,13 @@ class Reclaimer:
             for request, result in zip(chunk, results):
                 self.prefetched[request['operation'], request['path'], request.get('days')] = result
 
+    def load_activity(self):
+        if self.activity is None:
+            self.activity = probe(self.host, 'activity')
+            for note in self.activity['notes'] + self.activity['blocked']:
+                if note not in self.report.notes:
+                    self.report.notes.append(note)
+
     def ask(self, operation, path, fresh, **request):
         found = None if fresh else self.prefetched.get((operation, path, request.get('days')))
         if found is None or 'skipped' in found:
@@ -368,8 +439,10 @@ class Reclaimer:
         return found['result']
 
     def safe(self, path, days=0, allow_git=False, fresh=False, archive=False):
-        if self.activity is None and not fresh:
-            self.activity = probe(self.host, 'activity')
+        if not fresh:
+            self.load_activity()
+            if self.activity['blocked']:
+                raise ValueError('; '.join(self.activity['blocked']))
         info = self.ask('guard', path, fresh, days=days, activity=None if fresh else self.activity)
         context = self.ask('context', path, fresh)
         contexts = self.ask('repositories', path, fresh)
@@ -419,10 +492,7 @@ class Reclaimer:
             reason = 'scheduler references ' + ', '.join(references) if references else ''
         else:
             reason = protection.reason(path, allow_git=allow_git) if fresh or path not in self.checked else self.checked[path]
-        if reason:
-            if 'incomplete' in reason or 'unavailable' in reason or 'timed out' in reason:
-                raise RuntimeError(reason)
-            raise ValueError(reason)
+        blocked(reason)
         return info
 
     def worktrees(self):
@@ -431,77 +501,115 @@ class Reclaimer:
         self.report.errors.extend('Worktree discovery incomplete: ' + error for error in discovery['errors'])
         self.report.notes.extend(discovery['notes'])
         self.checked = self.protection.batch(paths, allow_git=True) if self.host.kind != 'powershell' else {}
-        for path in paths:
-            size = 0
-            try:
-                local = probe(self.host, 'repo', path=path)
-                if local['dirty'] or local['stashes']:
-                    raise ValueError('IN USE: uncommitted work or stashes')
-                state, prs, listing = self.proof(path)
-                reason = completion(state, prs)
-                if reason:
-                    raise ValueError(reason)
-                days = (min(self.config['worktree_idle_days'], tiers.WORKTREE_MERGED_DAYS)
-                        if state['merged'] else self.config['worktree_idle_days'])
-                info = self.safe(path, days, True)
-                size = info['bytes']
-                if not self.apply or 'worktree' not in self.config['live']:
-                    self.log('worktree', path, 'would remove worktree', size,
-                             'DURABLE ELSEWHERE: current head is published and merged/closed; ignored data requires a verified NAS copy' if state['ignored'] else
-                             'DURABLE ELSEWHERE: clean published head is merged/closed')
-                    continue
-                def recheck():
-                    current, current_prs, _ = self.proof(path, True)
-                    problem = completion(current, current_prs)
-                    if problem or current['head'] != state['head']:
-                        raise ValueError(problem or 'head changed after preview')
-                    self.safe(path, days, True, True)
-                recheck()
-                manifest = None; saved = None; security = None
-                if state['ignored']:
-                    drive = self.archive_target(path)
-                    saved, manifest, security = preserve(self.host, path, self.config['nas_root'], lambda: (recheck(), self.archive_target(path, drive)))
-                current, current_prs, listing = self.proof(path, True)
-                if completion(current, current_prs) or current['head'] != state['head']:
-                    raise ValueError('Git completion changed before removal')
-                if saved:
-                    self.archive_present(path, drive, saved)
-                removed = probe(self.host, 'remove', path=path, days=days,
-                                head=state['head'], listing=listing, manifest=manifest, security=security, keep=self.keep(saved))
-                action = 'remove worktree and local branch' if removed['branch_removed'] else 'remove worktree; retain local branch'
-                self.log('worktree', path, action, size,
-                         'DURABLE ELSEWHERE: published merged/closed head; clean, no process or T3 use' +
-                         ('; ignored files SHA-256 verified at ' + saved.archive_path if saved else ''))
-            except ValueError as exc:
-                self.log('worktree', path, 'skip', size, str(exc))
-            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-                self.log('worktree', path, 'error', size, str(exc))
+        try:
+            for path in paths:
+                size = 0
+                try:
+                    local = probe(self.host, 'repo', path=path)
+                    if local['dirty'] or local['stashes']:
+                        raise ValueError('IN USE: uncommitted work or stashes')
+                    state, prs, listing = self.proof(path)
+                    reason = completion(state, prs)
+                    if reason:
+                        raise ValueError(reason)
+                    days = (min(self.config['worktree_idle_days'], tiers.WORKTREE_MERGED_DAYS)
+                            if state['merged'] else self.config['worktree_idle_days'])
+                    info = self.safe(path, days, True)
+                    size = info['bytes']
+                    if not self.apply or 'worktree' not in self.config['live']:
+                        self.log('worktree', path, 'would remove worktree', size,
+                                 'DURABLE ELSEWHERE: current head is published and merged/closed; ignored data requires a verified NAS copy' if state['ignored'] else
+                                 'DURABLE ELSEWHERE: clean published head is merged/closed')
+                        continue
+                    def recheck():
+                        current, current_prs, _ = self.proof(path, True)
+                        problem = completion(current, current_prs)
+                        if problem or current['head'] != state['head']:
+                            raise ValueError(problem or 'head changed after preview')
+                        self.safe(path, days, True, True)
+                    recheck()
+                    manifest = None; saved = None; security = None
+                    if state['ignored']:
+                        drive = self.archive_target(path)
+                        saved, manifest, security = preserve(self.host, path, self.config['nas_root'], lambda: (recheck(), self.archive_target(path, drive)))
+                    current, current_prs, listing = self.proof(path, True)
+                    if completion(current, current_prs) or current['head'] != state['head']:
+                        raise ValueError('Git completion changed before removal')
+                    if saved:
+                        self.archive_present(path, drive, saved)
+                    removed = probe(self.host, 'remove', path=path, days=days,
+                                    head=state['head'], listing=listing, manifest=manifest, security=security, keep=self.keep(saved))
+                    action = 'remove worktree and local branch' if removed['branch_removed'] else 'remove worktree; retain local branch'
+                    self.log('worktree', path, action, size,
+                             'DURABLE ELSEWHERE: published merged/closed head; clean, no process, T3 or Codex use' +
+                             ('; ignored files SHA-256 verified at ' + saved.archive_path if saved else ''))
+                except ValueError as exc:
+                    self.skip('worktree', path, size, str(exc))
+                except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                    self.log('worktree', path, 'error', size, str(exc))
+        finally:
+            self.size_skips()
 
     def archives(self):
         paths = probe(self.host, 'expand', patterns=self.rules.get('archive', []))
         self.checked = {}
         self.prefetch([(path, retention(path, self.config['archive_idle_days'])) for path in paths if not package_cache(path)])
-        for path in paths:
-            size = 0
+        try:
+            for path in paths:
+                size = 0
+                try:
+                    if package_cache(path):
+                        raise ValueError('package caches are excluded')
+                    days = retention(path, self.config['archive_idle_days'])
+                    info = self.safe(path, days, archive=True)
+                    size = info['bytes']
+                    if not self.apply or 'archive' not in self.config['live']:
+                        self.log('archive', path, 'would archive and remove', size,
+                                 'UNIQUE: copy to NAS and verify every file SHA-256 before removal')
+                        continue
+                    recheck = lambda: self.safe(path, days, fresh=True, archive=True)
+                    recheck()
+                    drive = self.archive_target(path)
+                    saved, manifest, security = preserve(self.host, path, self.config['nas_root'], lambda: (recheck(), self.archive_target(path, drive)))
+                    self.archive_present(path, drive, saved)
+                    probe(self.host, 'remove', path=path, days=days, manifest=manifest, security=security, keep=self.keep(saved))
+                    self.log('archive', path, 'archive and remove', size,
+                             'DURABLE ELSEWHERE: every file SHA-256 verified at ' + saved.archive_path)
+                except ValueError as exc:
+                    self.skip('archive', path, size, str(exc))
+                except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                    self.log('archive', path, 'error', size, str(exc))
+        finally:
+            self.size_skips()
+
+    def caches(self):
+        tools = self.rules.get('cache_tools', [])
+        if not tools:
+            return
+        try:
+            rows = probe(self.host, 'cache-tools', tools=tools, seconds=SIZE_SECONDS)
+            reasons = self.protection.batch([row['path'] for row in rows if not row['skip']])
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            for tool in tools:
+                self.log('cache', tool, 'error', 0, str(exc))
+            return
+        for row in rows:
+            path, size = row['path'] or row['tool'], row['bytes']
+            reason = 'REGENERABLE: ' + row['tool'] + "'s own cleaner decides what to remove; bytes are the cache size"
             try:
-                if package_cache(path):
-                    raise ValueError('package caches are excluded')
-                days = retention(path, self.config['archive_idle_days'])
-                info = self.safe(path, days, archive=True)
-                size = info['bytes']
-                if not self.apply or 'archive' not in self.config['live']:
-                    self.log('archive', path, 'would archive and remove', size,
-                             'UNIQUE: copy to NAS and verify every file SHA-256 before removal')
+                if row['skip']:
+                    raise ValueError(row['skip'])
+                blocked(reasons.get(path, 'protection check incomplete: missing result'))
+                if not row['complete']:
+                    reason += ', a lower bound'
+                if not self.apply or 'cache' not in self.config['live']:
+                    self.log('cache', path, 'would run ' + row['command'], size, reason)
                     continue
-                recheck = lambda: self.safe(path, days, fresh=True, archive=True)
-                recheck()
-                drive = self.archive_target(path)
-                saved, manifest, security = preserve(self.host, path, self.config['nas_root'], lambda: (recheck(), self.archive_target(path, drive)))
-                self.archive_present(path, drive, saved)
-                probe(self.host, 'remove', path=path, days=days, manifest=manifest, security=security, keep=self.keep(saved))
-                self.log('archive', path, 'archive and remove', size,
-                         'DURABLE ELSEWHERE: every file SHA-256 verified at ' + saved.archive_path)
+                blocked(protect.collect(self.host).reason(path))
+                done = probe(self.host, 'cache-clean', tool=row['tool'], path=path, seconds=SIZE_SECONDS)
+                self.log('cache', path, 'run ' + row['command'], max(0, done['before'] - done['after']),
+                         'REGENERABLE: freed bytes measured before and after')
             except ValueError as exc:
-                self.log('archive', path, 'skip', size, str(exc))
+                self.log('cache', path, 'skip', size, str(exc))
             except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
-                self.log('archive', path, 'error', size, str(exc))
+                self.log('cache', path, 'error', size, str(exc))

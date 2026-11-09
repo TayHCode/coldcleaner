@@ -377,7 +377,8 @@ lsof: WARNING: can't stat() nsfs file system /var/snap/lxd/common/ns/mntns
 time.monotonic = lambda: 0
 def blocked_walk(*args, **kwargs):
     time.monotonic = lambda: 841
-    signal.raise_signal(signal.SIGALRM)
+    signal.setitimer(signal.ITIMER_REAL, 0.01)
+    time.sleep(4)
 os.walk = blocked_walk''')
         result = subprocess.run(['python3', '-c', source], input=json.dumps([paths, False, True]),
             text=True, capture_output=True, check=True, timeout=5)
@@ -1133,7 +1134,7 @@ class CliReportTests(CoreCase):
                     self.assertEqual(code, 2)
                     measured.assert_not_called(); protection.assert_not_called(); cleaner.assert_not_called()
                     continue
-                self.assertEqual(code, int(percent >= 80))
+                self.assertEqual(code, 3 if percent >= 80 else 0)
                 protection.assert_called_once_with(self.host)
                 self.assertEqual(cleaner.call_count, 1)
                 self.assertEqual([call.args[0] for call in measured.call_args_list],
@@ -1142,6 +1143,7 @@ class CliReportTests(CoreCase):
         self.assertIn('## winhost-wsl', text)
         self.assertIn('Before: 80.00%', text)
         self.assertIn('After: 80.00%', text)
+        self.assertIn('- ATTENTION: disk 80.00% is at or above alert_pct 80%', text)
         self.assertIn('Windows WSL execution is retired', text)
         self.assertNotIn('Protection inventory unavailable', text)
 
@@ -1275,11 +1277,12 @@ class CliReportTests(CoreCase):
 
     def test_exit_alert_after_run(self):
         code, _ = self.invoke([disk.Usage(100, 90, 90), disk.Usage(100, 80, 80)])
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         path = next((self.root / 'reports').glob('*.md'))
         text = path.read_text()
         self.assertIn('Before: 90.00%', text)
         self.assertIn('After: 80.00%', text)
+        self.assertIn('- ATTENTION: disk 80.00% is at or above alert_pct 80%', text)
         self.assertNotIn('incomplete', text)
 
     def test_low_disk_runs_daily_tiers_but_not_project(self):
@@ -1309,7 +1312,8 @@ class CliReportTests(CoreCase):
         self.entry.actions = [dict(tier='cache', path='/a|b', action='would clean cache', bytes=123, reason=''),
                               dict(tier='archive', path='/blocked', action='skip', bytes=456, reason='open\nfile')]
         self.assertEqual(self.entry.would_free, 123)
-        text = report.render([self.entry])
+        self.assertNotIn('Google DriveFS', report.render([self.entry]))
+        text = report.render([self.entry], manual_notes=['Review Google DriveFS offline files.'])
         self.assertIn('/a\\|b', text)
         self.assertIn('open file', text)
         self.assertIn('123 bytes', text)
