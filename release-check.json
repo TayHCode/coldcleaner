@@ -344,6 +344,16 @@
       "path": "tests/test_reclaim.py",
       "fingerprint": "e1bf92542b227512",
       "reason": "Generic placeholder macOS home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "fleet-cli",
+      "path": "coldbox.toml",
+      "line": 8,
+      "fingerprint": "7ae68281c8f359a7",
+      "source_sha256": "65a030cfef189e8944abffdff04330b6e2417827156bc31793bc1de807fc31c8",
+      "classification": "false-positive",
+      "reason": "Public CI path, not private data, already public since PR #1. This historical command is replaced by the repository test script in the current tree."
     }
   ]
 }
