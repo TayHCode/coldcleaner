@@ -141,9 +141,9 @@ class ConfiguredHostTests(unittest.TestCase):
 
     def test_local_output_paths_are_protected_for_custom_host_names(self):
         with self.assertRaisesRegex(ValueError, 'mine.roots.*would clean up nas_root'):
-            self.load('[hosts.mine]\nkind = "posix"\nroots = ["/srv/coldcleaner"]')
-        config = self.load('[hosts.remote]\nkind = "posix"\nssh = "remote.example.invalid"\nroots = ["/srv/coldcleaner"]')
-        self.assertEqual(config['hosts']['remote']['roots'], ['/srv/coldcleaner'])
+            self.load('[hosts.mine]\nkind = "posix"\nroots = ["~/.local/share/coldcleaner"]')
+        config = self.load('[hosts.remote]\nkind = "posix"\nssh = "remote.example.invalid"\nroots = ["~/.local/share/coldcleaner"]')
+        self.assertEqual(config['hosts']['remote']['roots'], ['~/.local/share/coldcleaner'])
 
 if __name__ == "__main__":
     unittest.main()

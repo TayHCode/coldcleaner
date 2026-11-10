@@ -1,5 +1,6 @@
 import importlib.metadata
 import subprocess
+import tomllib
 from pathlib import Path
 
 CHECKOUT = Path(__file__).resolve().parent.parent
@@ -30,3 +31,13 @@ def installed():
         return 'installed coldcleaner ' + importlib.metadata.version('coldcleaner') + ' (not a Git checkout; revision unknown)'
     except importlib.metadata.PackageNotFoundError:
         return None
+
+
+def number():
+    try:
+        project = tomllib.loads((CHECKOUT / 'pyproject.toml').read_text(encoding='utf-8')).get('project', {})
+    except FileNotFoundError:
+        project = {}
+    if isinstance(project, dict) and project.get('name') == 'coldcleaner':
+        return project['version']
+    return importlib.metadata.version('coldcleaner')

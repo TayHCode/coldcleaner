@@ -5,18 +5,29 @@ import sys
 import time
 from pathlib import Path
 
-from . import disk, gitsafe, hosts, protect, reclaim, report, rules, store, tiers, version
+from . import disk, doctor, gitsafe, hosts, protect, reclaim, report, rules, store, tiers, version
 
 
-def summary(reports, apply, path, code, failed, errors):
+def summary(reports, apply, path, code, status, errors):
     def percent(usage):
         return None if usage is None else round(usage.percent, 2)
-    return dict(status='incomplete' if failed else 'ok', mode='apply' if apply else 'dry-run', code=code, report=path and str(path), errors=list(errors),
+    return dict(status=status, mode='apply' if apply else 'dry-run', code=code, report=path and str(path), errors=list(errors),
                 hosts=[dict(name=entry.name, disk_before_percent=percent(entry.before), disk_after_percent=percent(entry.after),
                             would_free_bytes=entry.would_free, acted_bytes=entry.acted_bytes, errors=entry.errors, notes=entry.notes,
                             skipped=sum(row['action'] == 'skip' for row in entry.actions),
                             actions=[row for row in entry.actions if row['action'] != 'skip'])
                        for entry in reports])
+
+
+def failure_reasons(reports, errors):
+    reasons = list(errors)
+    for entry in reports:
+        reasons += [f'{entry.name}: {problem}' for problem in entry.errors]
+        failed_rows = [row for row in entry.actions if row['action'] == 'error']
+        if failed_rows:
+            first = failed_rows[0]
+            reasons.append(f"{entry.name}: {len(failed_rows)} error action(s), first {first['path']}: {first['reason']}")
+    return reasons
 
 
 def run(config, chosen_hosts, apply=False, github_only=False, *, reclaim_only=False, as_json=False):
@@ -48,7 +59,7 @@ def run(config, chosen_hosts, apply=False, github_only=False, *, reclaim_only=Fa
                         if protect.broad_reference(path, protection.home, host.kind == 'powershell'))
                 cleaner = (reclaim.Reclaimer(host, config, apply, protection, entry) if reclaim_only else
                            tiers.Cleaner(host, config, apply, protection, entry, gitsafe, store))
-                selected = ('worktrees', 'archives') if reclaim_only else ('github',) if github_only else rules.selected(entry.before.percent, config)
+                selected = ('worktrees', 'archives', 'caches') if reclaim_only else ('github',) if github_only else rules.selected(entry.before.percent, config)
                 for tier in selected:
                     started = time.monotonic()
                     print(f'{host.name}: {tier} start', **progress)
@@ -72,7 +83,7 @@ def run(config, chosen_hosts, apply=False, github_only=False, *, reclaim_only=Fa
         if entry.errors or any(action['action'] == 'error' for action in entry.actions):
             failed = True
         if entry.after and entry.after.percent >= config['alert_pct']:
-            failed = True
+            entry.attention = f"disk {entry.after.percent:.2f}% is at or above alert_pct {config['alert_pct']}%"
     if not github_only and not reclaim_only and reports:
         cap_live = apply and bool({'archive', 'project'} & set(config['live']))
         try:
@@ -84,46 +95,74 @@ def run(config, chosen_hosts, apply=False, github_only=False, *, reclaim_only=Fa
             reports[0].errors.append('NAS cap check incomplete: ' + str(exc))
             failed = True
     if github_only:
-        print(report.render(reports, apply))
+        print(report.render(reports, apply, manual_notes=config.get('manual_notes', ())))
     else:
         try:
-            path = report.write(reports, config['report_dir'], apply, code)
+            path = report.write(reports, config['report_dir'], apply, code, config.get('manual_notes', ()))
         except OSError as exc:
             path, failed = None, True
             problem = 'Report not written: ' + str(exc)
             (reports[0].errors if reports else errors).append(problem)
+        if failed:
+            for reason in failure_reasons(reports, errors):
+                print('coldcleaner: FAILED: ' + reason, file=sys.stderr, flush=True)
+        for entry in reports:
+            if entry.attention:
+                print(f'coldcleaner: ATTENTION: {entry.name}: {entry.attention}', file=sys.stderr, flush=True)
         if as_json:
-            print(json.dumps(summary(reports, apply, path, code, failed, errors), default=str))
-            return int(failed)
+            result = exit_code(failed, reports)
+            status = {0: 'ok', 1: 'incomplete', 3: 'attention'}[result]
+            print(json.dumps(summary(reports, apply, path, code, status, errors), default=str))
+            return result
         print(path or problem)
         for entry in reports:
             acted = f'; acted on {report.size(entry.acted_bytes)}' if apply else ''
             print(f'{entry.name}: {report.usage(entry.before)} -> {report.usage(entry.after)}; would free {report.size(entry.would_free)}{acted}')
-    return int(failed)
+    return exit_code(failed, reports)
+
+
+def exit_code(failed, reports):
+    return 1 if failed else 3 if any(entry.attention for entry in reports) else 0
+
+
+class PrintVersion(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, help='Print the coldcleaner version and exit.')
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            number = version.number()
+        except (OSError, ValueError, KeyError, ImportError) as exc:
+            parser.exit(1, f'coldcleaner: version unknown: {exc}\n')
+        print(f'coldcleaner {number}')
+        parser.exit()
 
 
 def parser():
-    result = argparse.ArgumentParser(prog='coldcleaner')
+    result = argparse.ArgumentParser(prog='coldcleaner', description='Free disk space from finished Git worktrees and idle listed folders. '
+                                     'Cleanup is a dry run unless you pass --apply.')
+    result.add_argument('--version', action=PrintVersion)
     commands = result.add_subparsers(dest='command', required=True)
     descriptions = {
         'run': 'Preview legacy tiers. Apply cleanup with reclaim instead.',
-        'reclaim': 'Reclaim agent work and staging with current GitHub, process, T3 and verified NAS proofs; exclude package caches.',
+        'reclaim': 'Remove finished Git worktrees and idle listed folders, after checking GitHub, running programs and coding agents and verifying an archive copy. Package caches are cleaned only by the own cleaners of the tools listed in cache_tools.',
         'status': 'Show disk usage per host and the last report.',
         'github': 'Inspect Git repositories and preview GitHub backups.',
-        'find': 'Search NAS archives and their file lists.',
+        'find': 'Search archives and their file lists.',
         'restore': 'Restore an archive to its original host or recover a legacy archive on a POSIX host.',
         'check-rules': 'Validate a rules file offline.',
+        'doctor': 'Check prerequisites read-only and print PASS or FAIL for each.',
     }
     for name, description in descriptions.items():
         command = commands.add_parser(name, help=description, description=description)
         command.add_argument('--rules', type=Path, default=rules.DEFAULT_PATH, help='Read configuration from this rules file.')
-        if name in ('run', 'reclaim', 'github', 'status'):
+        if name in ('run', 'reclaim', 'github', 'status', 'doctor'):
             command.add_argument('--host', help='Select one host instead of all hosts.')
         if name in ('run', 'reclaim', 'github'):
             command.add_argument('--apply', action='store_true', help='Perform actions enabled by the rules instead of a dry run.')
         if name == 'reclaim':
-            command.add_argument('--json', action='store_true', help='Print one JSON summary on stdout and progress on stderr. Exit 0 when complete, 1 when incomplete, 2 when refused.')
-        if name in ('run', 'reclaim', 'status'):
+            command.add_argument('--json', action='store_true', help='Print one JSON summary on stdout and progress on stderr. Exit 0 when complete, 1 when incomplete, 2 when refused, 3 when complete but a host is at or above alert_pct.')
+        if name in ('run', 'reclaim', 'status', 'doctor'):
             command.add_argument('--report-dir', type=Path, help='Use this directory for cleanup reports.')
         if name == 'find':
             command.add_argument('term', help='Search archive records and file paths for this text.')
@@ -179,7 +218,7 @@ def main(argv=None):
     except (OSError, ValueError) as exc:
         if args.command == 'check-rules':
             print(rules_problem(args.rules, exc))
-            return 1
+            return 2 if isinstance(exc, OSError) else 1
         return refuse(args, rules_problem(args.rules, exc))
     for option in ('host', 'to_host'):
         name = getattr(args, option, None)
@@ -197,9 +236,11 @@ def main(argv=None):
         if getattr(args, 'report_dir', None):
             config['report_dir'] = str(args.report_dir.resolve())
         selected = [hosts.HOSTS[args.host]] if getattr(args, 'host', None) else list(hosts.HOSTS.values())
+        if args.command in ('reclaim', 'doctor') and not args.host:
+            selected = [hosts.HOSTS[name] for name in config['reclaim_hosts']]
+        if args.command == 'doctor':
+            return doctor.main(config, selected)
         if args.command == 'reclaim':
-            if not args.host:
-                selected = [hosts.HOSTS[name] for name in config['reclaim_hosts']]
             return run(config, selected, args.apply, reclaim_only=True, as_json=args.json)
         if args.command in ('run', 'github'):
             return run(config, selected, args.apply, args.command == 'github')

@@ -158,6 +158,30 @@ class StoreTests(unittest.TestCase):
         self.assertFalse((self.nas / "INDEX.csv").exists())
         self.assertEqual(list(self.nas.rglob("*.partial")), [])
 
+    def test_compressor_launch_failure_is_reported_when_signals_are_denied(self):
+        original_popen = subprocess.Popen
+
+        def missing_compressor(args, **kwargs):
+            if args[0] == "zstd":
+                raise FileNotFoundError("zstd is missing")
+            return original_popen(args, **kwargs)
+
+        denied = PermissionError(13, "Permission denied")
+        with patch.object(original_popen, "terminate", side_effect=denied), \
+                patch.object(store.subprocess, "Popen", side_effect=missing_compressor):
+            with self.assertRaises(OSError) as raised:
+                self.archive()
+        self.assertEqual(str(raised.exception), "zstd is missing")
+        self.assertTrue(self.source.exists())
+        self.assertFalse((self.nas / "INDEX.csv").exists())
+        self.assertEqual(list(self.nas.rglob("*.partial")), [])
+
+    def test_original_bytes_counts_content_not_disk_allocation(self):
+        with (self.source / "sparse").open("wb") as stream:
+            stream.truncate(4 * 1024 * 1024)
+        record = store.archive(self.host, self.source, nas_root=self.nas)
+        self.assertGreaterEqual(record.original_bytes, 4 * 1024 * 1024)
+
     def test_tar_producer_failure_with_successful_compression_keeps_source(self):
         expected = self.snapshot(self.source)
         popen = hosts.popen

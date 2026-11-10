@@ -7,7 +7,7 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -125,14 +125,15 @@ def _pipe(producer, consumer):
                 if process.stdout is not None:
                     process.stdout.close()
                 if process.poll() is None:
-                    process.terminate()
+                    with suppress(PermissionError):
+                        process.terminate()
                 process.wait()
 
 
 def _measure(host, path):
     quoted = shlex.quote(str(path))
     script = (f"set -euo pipefail; {{ test -d {quoted} || test -f {quoted}; }}; test ! -L {quoted}; "
-              f"du -sk {quoted}; "
+              f"{{ du -sk --apparent-size {quoted} 2>/dev/null || du -skA {quoted}; }}; "
               f"find {quoted} -exec sh -c 'for p do printf x; done' sh {{}} + | wc -c")
     lines = hosts.run(host, script).stdout.decode().splitlines()
     return int(lines[0].split()[0]) * 1024, int(lines[-1].strip())

@@ -2,6 +2,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -577,7 +578,11 @@ class GitSafeTests(unittest.TestCase):
         (worktree / ".gitignore").unlink()
         (self.repo / ".git/info/exclude").write_text("output/\n")
         (worktree / "output").mkdir()
-        (worktree / "output/bench.bin").write_bytes(os.urandom(3 * 1024 * 1024))
+        bench = worktree / "output/bench.bin"
+        bench.write_bytes(os.urandom(3 * 1024 * 1024))
+        deadline = time.monotonic() + 30
+        while bench.stat().st_blocks * 512 < 3 * 1024 * 1024 and time.monotonic() < deadline:
+            time.sleep(0.1)
         check = gitsafe.worktree_check(self.host, worktree, 1024)
         self.assertTrue(check.clean)
         self.assertGreater(check.ignored_kb, 1024)

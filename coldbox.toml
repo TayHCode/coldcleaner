@@ -5,4 +5,4 @@ test = true  # python3 -m pytest -q
 verify = true
 
 [commands]
-verify = "python3 /opt/coldstack/cold verify --ci"
+verify = "bash .fleet/verify.sh"

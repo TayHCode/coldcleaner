@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coldcleaner"
-version = "0.1.0"
+version = "0.1.1"
 description = "Dry-run-first disk cleanup for Linux, macOS, Windows and WSL hosts, controlled from one machine."
 readme = "README.md"
 license = "MIT"

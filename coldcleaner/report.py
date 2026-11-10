@@ -34,6 +34,7 @@ class HostReport:
     notes: list = field(default_factory=list)
     summary: object = ''
     broad_references: list = field(default_factory=list)
+    attention: str = ''
 
     @property
     def would_free(self):
@@ -55,7 +56,7 @@ def action_table(lines, rows):
         lines.append('| ' + ' | '.join(map(cell, values)) + ' |')
 
 
-def render(reports, apply=False, code=None):
+def render(reports, apply=False, code=None, manual_notes=()):
     now = datetime.now(timezone.utc)
     lines = [f'# coldcleaner {now:%Y-%m-%d %H:%M:%S} UTC', '',
              f'Mode: {"apply, limited to live tiers" if apply else "dry run"}. Byte estimates are logical file sizes, not guaranteed free space.', '']
@@ -66,6 +67,8 @@ def render(reports, apply=False, code=None):
                       f'After: {usage(report.after)}', '', f'Would free: {size(report.would_free)}', ''])
         if apply:
             lines.extend([f'Acted on: {size(report.acted_bytes)}', ''])
+        if report.attention:
+            lines.append(f'- ATTENTION: {cell(report.attention)}')
         lines.extend(f'- {cell(error)}' for error in report.errors)
         lines.extend(f'- Note: {cell(note)}' for note in report.notes)
         if report.broad_references:
@@ -91,20 +94,18 @@ def render(reports, apply=False, code=None):
         if report.summary:
             lines.extend(['', str(report.summary)])
         lines.append('')
-    lines.extend(['## Manual fixes, report only', '',
-                  '- Windows Google DriveFS cache at `%LOCALAPPDATA%\\Google\\DriveFS` was previously measured at 362 GB. Switch Google Drive to Stream files after reviewing offline needs.',
-                  '- Review Ollama and llama.cpp model downloads manually.',
-                  '- Review Mac Messages attachments manually.', ''])
+    if manual_notes:
+        lines.extend(['## Manual fixes, report only', '', *(f'- {note}' for note in manual_notes), ''])
     return '\n'.join(lines)
 
 
-def write(reports, directory, apply=False, code=None):
+def write(reports, directory, apply=False, code=None, manual_notes=()):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f'{datetime.now(timezone.utc):%Y-%m-%d-%H%M%S-%f}-{uuid.uuid4().hex}.md'
     temporary = path.with_suffix(f'.{os.getpid()}.tmp')
     try:
-        temporary.write_text(render(reports, apply, code), encoding='utf-8', errors='backslashreplace')
+        temporary.write_text(render(reports, apply, code, manual_notes), encoding='utf-8', errors='backslashreplace')
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)

@@ -6,13 +6,15 @@ worktree_idle_days = 7
 archive_idle_days = 4
 project_idle_days = 28
 nas_cap_gb = 500
-nas_root = "/srv/coldcleaner/archive"
+nas_root = "~/.local/share/coldcleaner/archive" # Archiving refuses until this is on a NAS or under local_archive_mount.
 local_archive_mount = ""
-report_dir = "/srv/coldcleaner/reports"
+report_dir = "~/.local/state/coldcleaner/reports"
+actions_log_mb = 10
 compact_weekday = "sun"
 live = []
 regenerable_paths = ["node_modules", ".venv", "venv", "target", "dist", "build", "__pycache__", ".cache", ".next"]
 already_compressed_extensions = [".zip", ".gz", ".zst", ".7z", ".jpg", ".jpeg", ".png", ".mp4", ".mov", ".mp3", ".flac", ".gguf", ".safetensors"]
+manual_notes = []
 
 [hosts.local]
 kind = "posix"
@@ -21,6 +23,7 @@ roots = []
 archive = []
 compact = []
 cache = []
+cache_tools = [] # Native package-cache cleaners: uv, npm, pnpm, pip, brew. POSIX hosts only; acts only with "cache" in live.
 
 # Remote POSIX example. Uncomment and set your SSH destination and paths.
 # [hosts.server]
