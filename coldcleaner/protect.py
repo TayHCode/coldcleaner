@@ -14,14 +14,21 @@ import glob, json, os, subprocess, sys
 text = []
 errors = []
 seen = set()
-def read(path):
-    path = os.path.realpath(path)
-    if path in seen:
+def unit_not_loaded(name):
+    result = subprocess.run(['systemctl', 'show', '--property=LoadState', '--value', name], capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip() == 'not-found'
+def read(path, unit=False):
+    target = os.path.realpath(path)
+    if target in seen:
         return
-    seen.add(path)
     try:
-        with open(path) as f:
+        with open(target) as f:
             text.append(f.read())
+        seen.add(target)
+    except FileNotFoundError as exc:
+        names = {os.path.basename(path), os.path.basename(target)}
+        if not (unit and os.path.islink(path) and all(unit_not_loaded(name) for name in names)):
+            errors.append(str(exc))
     except (OSError, UnicodeError) as exc:
         errors.append(str(exc))
 if sys.platform == 'darwin':
@@ -42,8 +49,7 @@ else:
     for root in ('/etc/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system'):
         for base, dirs, files in os.walk(root):
             for name in files:
-                path = os.path.join(base, name)
-                read(path)
+                read(os.path.join(base, name), unit=True)
     for path in glob.glob('/etc/cron.d/*') + glob.glob('/etc/crontab'):
         read(path)
 r = subprocess.run(['crontab', '-l'], capture_output=True, text=True)

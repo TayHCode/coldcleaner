@@ -4,14 +4,15 @@ Coldcleaner frees disk space that coding work leaves behind. It removes finished
 
 > **What it never touches**
 >
-> - Anything you did not list in your rules file. Big unknown folders show up in the report and stay where they are.
+> - Anything you did not list in your rules file. The report lists the largest folders directly under home or `roots`, but never touches them.
 > - Anything a scheduled job uses (cron, systemd, launchd or Windows Task Scheduler).
 > - Any file a running program has open, any folder holding one, and any worktree a coding agent is still using.
 > - Any folder with a `.keep-local` file in it or above it.
+> - System, personal and cloud-drive folders, Obsidian vaults and a host's `protected` list ([list](docs/reference.md#protections-in-detail)).
 > - Git work that is not on GitHub: uncommitted files, stashes, unpushed commits and open pull requests.
 > - Anything changed recently: 4 days for archived folders, 7 days for worktrees (1 day once merged).
 > - GitHub itself (no force-push, no new repositories), virtual machines, containers and Docker volumes.
-> - Package caches, unless you list the tool in `cache_tools`; then only that tool's own cleaner runs.
+> - Package caches. They are out of scope, and an `archive` path that holds a well-known cache folder (`.cache`, `.npm`, `.cargo`, `.bun`, `npm-cache`, `pip-cache`, `uv-cache`, `go-build`, `node-compile-cache`) is skipped. Keep other caches out of `archive`.
 >
 > By default nothing is changed at all. It only deletes when you pass `--apply` **and** list that kind of cleanup in `live` in your rules file. The example rules list nothing.
 
@@ -31,20 +32,18 @@ Other ways to install (pipx, pip in a virtual environment, or running from the c
 
 ## Quick start (one machine)
 
-Run these from a copy of this repository:
-
 ```sh
-uv tool install .
+uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.1
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner"
-[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || cp rules.example.toml "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"
+[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.1/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
 coldcleaner doctor
 coldcleaner reclaim --host local
 ```
 
-1. `uv tool install .` adds a `coldcleaner` command to `~/.local/bin`.
-2. The next two lines copy the example rules file to `~/.config/coldcleaner/rules.toml` (or `$XDG_CONFIG_HOME/coldcleaner/rules.toml` if you set `XDG_CONFIG_HOME`), which is where coldcleaner looks. An existing file is kept.
+1. `uv tool install` installs the v0.3.1 release and adds a `coldcleaner` command to `~/.local/bin`. From a clone, `uv tool install .` installs that copy.
+2. The next two lines download the example rules file to `~/.config/coldcleaner/rules.toml` (or `$XDG_CONFIG_HOME/coldcleaner/rules.toml` if you set `XDG_CONFIG_HOME`), which is where coldcleaner looks. An existing file is kept.
 3. `doctor` checks what cleanup needs and prints one PASS or FAIL line for each item. It changes nothing. It exits 1 while anything fails; that is expected on a new machine, and the dry run below still works.
-4. `reclaim --host local` is a dry run. It changes nothing, writes a report and prints the report's path, then one line per host with its disk use and how much it would free. The report lists every action it would take, with the path, size and reason, and everything it skipped, with the reason.
+4. `reclaim --host local` is a dry run. It changes nothing, writes a report and prints the report's path, then one line per host with its disk use and how much it would free. The report lists each proposed action with its reason, and sums skips by reason.
 
 The example rules list no folders, so the first report has nothing to do. That is the point: you add folders next.
 
@@ -58,15 +57,14 @@ Open the rules file you just copied (`~/.config/coldcleaner/rules.toml`, or unde
 4. Run `coldcleaner check-rules`, then `coldcleaner reclaim --host local` again, and read the new report.
 5. When the report shows only what you expect, turn on one kind of cleanup, for example `live = ["archive"]`, and run `coldcleaner reclaim --host local --apply`.
 
-`--apply` refuses to run and exits 2 unless `live` lists `worktree` or `archive`. Worktree cleanup (`live = ["worktree"]`) also needs `gh` logged in, because it asks GitHub whether each branch was merged.
+`--apply` refuses to run and exits 2 unless `live` lists `worktree` or `archive`, and until a current-rules dry run covers each host. Worktree cleanup (`live = ["worktree"]`) also needs `gh` logged in, because it asks GitHub whether each branch was merged.
 
-There are three kinds of cleanup:
+There are two kinds of cleanup:
 
 | `live` entry | What it removes | When |
 | --- | --- | --- |
 | `worktree` | Git worktrees under `roots` (`git worktree remove`, then the local branch) | The worktree's commits are on GitHub, its branch is merged or its pull request is closed, and it has been idle 7 days (1 day once merged). Ignored files inside are archived first. |
 | `archive` | Folders listed in `archive` | Idle 4 days (system temp folders 7 days). Each is archived to `nas_root`, every file's SHA-256 checksum is compared with the original, and only then is it deleted. |
-| `cache` | Package caches of the tools listed in `cache_tools` (`uv`, `npm`, `pnpm`, `pip`, `brew`), Linux and macOS only | Daily, by running the tool's own cleaner, such as `uv cache prune`. Skipped while the tool is running or when any check fails. Acts only when `live` also lists `worktree` or `archive`. |
 
 Get anything back with `coldcleaner find TERM` (search archives by path) and `coldcleaner restore ID`, which never overwrites an existing path.
 
@@ -74,7 +72,15 @@ Get anything back with `coldcleaner find TERM` (search archives by path) and `co
 
 Once a live run looks right, schedule `coldcleaner reclaim --apply` daily with a systemd user timer on Linux or cron on macOS. Copy-paste setups for both are in [docs/reference.md](docs/reference.md#run-it-every-night).
 
-Exit codes: 0 means the run worked; 1 means a host was unreachable or a step failed; 2 means it refused to run (bad rules or arguments); 3 means the run worked but a disk is still at or above `alert_pct` (80% in the example).
+Exit codes: 0 means the run worked; 1 means a host was unreachable or a step failed; 2 means it refused to run (bad rules or arguments); 3 means the run worked but a disk is still at or above `alert_pct` (80% in the example), or a host reached its per-run deletion limit (`max_items_per_run`, `max_gib_per_run`).
+
+## Host-local policy
+
+Each host removes only what its own `~/.config/coldcleaner/local.json` allows, whatever the controller asks: worktrees under its `roots`, folders matching its `archive` globs. Without it, nothing is removed there.
+
+```json
+{"roots": ["~/projects"], "archive": ["/tmp/*"]}
+```
 
 ## Sudo
 
@@ -104,7 +110,7 @@ alice ALL=(root) NOPASSWD: /usr/sbin/lsof -nP -Fn, /bin/ps -axww -o command\=
 
 [docs/reference.md](docs/reference.md) has the details:
 
-- every command and option, including `status`, `github`, `find TERM`, `restore ID` and the legacy `run` preview;
+- every command and option, including `status`, `find TERM` and `restore ID`;
 - remote hosts over SSH, Windows and WSL;
 - archiving to a local drive instead of a NAS;
 - what the report shows, the actions log, and JSON output for other tools;
@@ -115,7 +121,7 @@ alice ALL=(root) NOPASSWD: /usr/sbin/lsof -nP -Fn, /bin/ps -axww -o command\=
 
 ## Limitations
 
-When any safety check fails or cannot run, coldcleaner keeps the item, so it often leaves behind things you expected it to remove. Native Windows GitHub inventory and projects with nested repositories need manual review. The tests use fake hosts and do not prove correctness on every remote system, so check a dry run of every new configuration before `--apply`. The full list is in [docs/reference.md](docs/reference.md#limitations).
+When any safety check fails or cannot run, coldcleaner keeps the item, so it often leaves behind things you expected it to remove. Projects with nested repositories need manual review. The tests use fake hosts and do not prove correctness on every remote system, so check a dry run of every new configuration before `--apply`. The full list is in [docs/reference.md](docs/reference.md#limitations).
 
 ## Development
 

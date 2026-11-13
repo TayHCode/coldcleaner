@@ -1,8 +1,0 @@
-# coldbox.toml: set a check to false to switch it off; replace a command under [commands].
-[checks]
-lint = true  # python3 -m compileall -q -x '/[.]|node_modules' .
-test = true  # python3 -m pytest -q
-verify = true
-
-[commands]
-verify = "bash .fleet/verify.sh"

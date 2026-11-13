@@ -1,29 +1,31 @@
-hard_pct = 85
 alert_pct = 80
-cache_idle_days = 0 # No additional cache inactivity requirement.
-compact_idle_days = 0 # No additional compaction inactivity requirement.
 worktree_idle_days = 7
 archive_idle_days = 4
-project_idle_days = 28
-nas_cap_gb = 500
 nas_root = "~/.local/share/coldcleaner/archive" # Archiving refuses until this is on a NAS or under local_archive_mount.
 local_archive_mount = ""
 report_dir = "~/.local/state/coldcleaner/reports"
+attention_note = "~/.local/state/coldcleaner/attention.md"
+memory_store = "~/.local/state/coldvault/preservation" # Receipts that make artifact entries eligible; never cleaned.
 actions_log_mb = 10
-compact_weekday = "sun"
+max_items_per_run = 200 # Per host; a host table may override it.
+max_gib_per_run = 100 # Per host; a host table may override it.
 live = []
-regenerable_paths = ["node_modules", ".venv", "venv", "target", "dist", "build", "__pycache__", ".cache", ".next"]
+approval = [] # Tiers (worktree, archive) that act only on items approved with coldcleaner approve.
 already_compressed_extensions = [".zip", ".gz", ".zst", ".7z", ".jpg", ".jpeg", ".png", ".mp4", ".mov", ".mp3", ".flac", ".gguf", ".safetensors"]
 manual_notes = []
 
 [hosts.local]
 kind = "posix"
+max_items_per_run = 200
+max_gib_per_run = 100
 shared_roots = []
 roots = []
 archive = []
-compact = []
-cache = []
-cache_tools = [] # Native package-cache cleaners: uv, npm, pnpm, pip, brew. POSIX hosts only; acts only with "cache" in live.
+protected = [] # Extra folders never acted on, beyond the built-in OS, personal, cloud-drive and Obsidian vault locations. No globs.
+exclude = [] # Paths or globs never archived; an archive match equal to, inside or holding one is dropped.
+# An archive entry may also be a table:
+# archive = [{ path = "~/projects/*/bench-out", days = 30, backup = "nas", exclude = ["~/projects/keep/bench-out"], approval = true }]
+# archive = [{ path = "~/.claude/projects/*/*.jsonl", category = "artifact", preservation = "sha256" }]
 
 # Remote POSIX example. Uncomment and set your SSH destination and paths.
 # [hosts.server]

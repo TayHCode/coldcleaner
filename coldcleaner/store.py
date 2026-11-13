@@ -7,7 +7,7 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -375,37 +375,3 @@ def restore(id, nas_root, *, to=None, member=None, to_host=None):
         finally:
             hosts.run(host, f"rm -rf -- {shlex.quote(staging)}")
     return replace(record, host=host.name, status="restored")
-
-
-def enforce_cap(nas_root, cap_bytes, *, apply=False):
-    if type(cap_bytes) is not int or cap_bytes < 0:
-        raise ValueError("cap_bytes must be a nonnegative integer")
-    root = Path(nas_root)
-    if not root.exists():
-        return []
-    with _index_lock(root) if apply else nullcontext():
-        records = _read_index(root)
-        candidates = [item for item in records if item.status != "expired"]
-        total = sum(item.archive_bytes for item in candidates)
-        expired = []
-        for record in sorted(candidates, key=lambda item: item.archived_at):
-            if total <= cap_bytes:
-                break
-            if _archive_path(root, record).with_suffix('.sha256.json').exists():
-                continue
-            _archive_path(root, record)
-            expired.append(replace(record, status="expired"))
-            total -= record.archive_bytes
-        if apply:
-            if expired:
-                ids = {item.id for item in expired}
-                records = [replace(item, status="expired") if item.id in ids else item for item in records]
-                _write_index(root, records)
-            for record in records:
-                if record.status == "expired":
-                    archive_path = _archive_path(root, record)
-                    if archive_path.with_suffix('.sha256.json').exists():
-                        continue
-                    archive_path.unlink(missing_ok=True)
-                    _manifest_path(archive_path).unlink(missing_ok=True)
-        return expired

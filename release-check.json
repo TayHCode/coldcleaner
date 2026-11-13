@@ -40,62 +40,6 @@
     {
       "scope": "tree",
       "kind": "email",
-      "path": "tests/test_core.py",
-      "fingerprint": "3de132cd98be7bf2",
-      "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
-    },
-    {
-      "scope": "tree",
-      "kind": "email",
-      "path": "tests/test_gitsafe.py",
-      "fingerprint": "3de132cd98be7bf2",
-      "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
-    },
-    {
-      "scope": "tree",
-      "kind": "ipv6",
-      "path": "coldcleaner/gitsafe.py",
-      "fingerprint": "bac182c2a7d2a65e",
-      "reason": "Python sequence slice syntax, not an IP address."
-    },
-    {
-      "scope": "tree",
-      "kind": "ipv6",
-      "path": "coldcleaner/gitsafe.py",
-      "fingerprint": "a7e2023a4d4bdd47",
-      "reason": "Python sequence slice syntax, not an IP address."
-    },
-    {
-      "scope": "history",
-      "kind": "ipv6",
-      "path": "coldcleaner/gitsafe.py",
-      "fingerprint": "bac182c2a7d2a65e",
-      "reason": "Python sequence slice syntax, not an IP address."
-    },
-    {
-      "scope": "history",
-      "kind": "ipv6",
-      "path": "coldcleaner/gitsafe.py",
-      "fingerprint": "a7e2023a4d4bdd47",
-      "reason": "Python sequence slice syntax, not an IP address."
-    },
-    {
-      "scope": "history",
-      "kind": "email",
-      "path": "tests/test_core.py",
-      "fingerprint": "3de132cd98be7bf2",
-      "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
-    },
-    {
-      "scope": "history",
-      "kind": "email",
-      "path": "tests/test_gitsafe.py",
-      "fingerprint": "3de132cd98be7bf2",
-      "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
-    },
-    {
-      "scope": "tree",
-      "kind": "email",
       "path": "coldcleaner/reclaim.py",
       "fingerprint": "3de132cd98be7bf2",
       "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
@@ -123,38 +67,10 @@
     },
     {
       "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_core.py",
-      "fingerprint": "612b6fc44e3094a3",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_core.py",
-      "fingerprint": "69eb62f06f02a93a",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_core.py",
-      "fingerprint": "d31a0d00d7f0c994",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "tree",
       "kind": "internal-host",
       "path": "tests/test_hosts.py",
       "fingerprint": "95a40ca5edbce963",
       "reason": "The generic host name local used by the example configuration, not a private machine."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_integration.py",
-      "fingerprint": "b75f6c27cdd233bc",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
     },
     {
       "scope": "tree",
@@ -182,27 +98,6 @@
       "kind": "home-path",
       "path": "tests/test_reclaim.py",
       "fingerprint": "66ae9804fdfebde9",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_reclaim.py",
-      "fingerprint": "5f1345634d18239e",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_reclaim.py",
-      "fingerprint": "90bde77f37a806d0",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "tests/test_reclaim.py",
-      "fingerprint": "dd4caf99e0b69111",
       "reason": "Generic placeholder home path in a test fixture, not a real account."
     },
     {
@@ -235,38 +130,10 @@
     },
     {
       "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_core.py",
-      "fingerprint": "612b6fc44e3094a3",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_core.py",
-      "fingerprint": "69eb62f06f02a93a",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_core.py",
-      "fingerprint": "d31a0d00d7f0c994",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "history",
       "kind": "internal-host",
       "path": "tests/test_hosts.py",
       "fingerprint": "95a40ca5edbce963",
       "reason": "The generic host name local used by the example configuration, not a private machine."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_integration.py",
-      "fingerprint": "b75f6c27cdd233bc",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
     },
     {
       "scope": "history",
@@ -297,27 +164,6 @@
       "reason": "Generic placeholder home path in a test fixture, not a real account."
     },
     {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_reclaim.py",
-      "fingerprint": "5f1345634d18239e",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_reclaim.py",
-      "fingerprint": "90bde77f37a806d0",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "tests/test_reclaim.py",
-      "fingerprint": "dd4caf99e0b69111",
-      "reason": "Generic placeholder home path in a test fixture, not a real account."
-    },
-    {
       "scope": "tree",
       "kind": "internal-host",
       "path": "README.md",
@@ -346,14 +192,102 @@
       "reason": "Generic placeholder macOS home path in a test fixture, not a real account."
     },
     {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_core.py",
+      "fingerprint": "b98d692c4574a80e",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_core.py",
+      "fingerprint": "1f3f523579ba76db",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_core.py",
+      "fingerprint": "8d6b26862863e91a",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_integration.py",
+      "fingerprint": "6600e9264f9f11ce",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "8d6b26862863e91a",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "b98d692c4574a80e",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
+    },
+    {
       "scope": "history",
-      "kind": "fleet-cli",
-      "path": "coldbox.toml",
-      "line": 8,
-      "fingerprint": "7ae68281c8f359a7",
-      "source_sha256": "65a030cfef189e8944abffdff04330b6e2417827156bc31793bc1de807fc31c8",
-      "classification": "false-positive",
-      "reason": "Public CI path, not private data, already public since PR #1. This historical command is replaced by the repository test script in the current tree."
+      "kind": "home-path",
+      "path": "tests/test_core.py",
+      "fingerprint": "b98d692c4574a80e",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_core.py",
+      "fingerprint": "1f3f523579ba76db",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_core.py",
+      "fingerprint": "8d6b26862863e91a",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_integration.py",
+      "fingerprint": "6600e9264f9f11ce",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "8d6b26862863e91a",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "b98d692c4574a80e",
+      "reason": "Generic placeholder home path in a test fixture, not a real account."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "tests/test_reclaim.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "reason": "Public Git SSH URL syntax with the fixed git user, not a personal identity."
     }
   ]
 }

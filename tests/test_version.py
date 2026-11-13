@@ -91,6 +91,13 @@ class VersionCase(unittest.TestCase):
         label = version.describe(self.checkout)
         self.assertRegex(label, r'^fix/old @ [0-9a-f]+ \(WARNING: does not contain origin/main')
 
+    def test_revision_is_the_full_head_commit_or_the_installed_label(self):
+        head = subprocess.run(['git', '-C', str(self.checkout), 'rev-parse', 'HEAD'],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(version.revision(self.checkout), head)
+        with patch('importlib.metadata.version', return_value='0.1.0'):
+            self.assertEqual(version.revision(self.root), 'installed coldcleaner 0.1.0 (not a Git checkout; revision unknown)')
+
     def test_installed_copy_reports_its_package_version(self):
         with patch('importlib.metadata.version', return_value='0.1.0'), patch.object(version, 'CHECKOUT', self.root):
             self.assertEqual(version.describe(self.root), 'installed coldcleaner 0.1.0 (not a Git checkout; revision unknown)')
@@ -113,7 +120,7 @@ class VersionCase(unittest.TestCase):
         reports = Path(self.root) / 'reports'
         saved = report.write([report.HostReport('one')], reports, code=label)
         self.assertIn(f'Code: {label}', saved.read_text().splitlines())
-        config = dict(report_dir=str(reports), alert_pct=80, hard_pct=85)
+        config = dict(report_dir=str(reports), alert_pct=80)
         output = io.StringIO()
         with patch.object(disk, 'measure', return_value=disk.Usage(100, 20, 20)), \
                 patch.object(rules, 'load', return_value=config), \
@@ -125,7 +132,7 @@ class VersionCase(unittest.TestCase):
     def test_cleanup_report_keeps_starting_version_when_checkout_advances(self):
         describe = version.describe
         label = describe(self.checkout)
-        config = rules.load(); config['report_dir'] = str(self.root / 'reports')
+        config = rules.load(); config.update(report_dir=str(self.root / 'reports'), nas_root=str(self.root / 'nas'))
         def measure(host):
             run(self.checkout, 'commit', '-q', '--allow-empty', '-m', 'during cleanup')
             return disk.Usage(100, 20, 20)
@@ -133,7 +140,7 @@ class VersionCase(unittest.TestCase):
                 patch.object(disk, 'measure', side_effect=measure), \
                 patch.object(protect, 'collect'), patch.object(cli.reclaim, 'Reclaimer'), \
                 contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.run(config, [hosts.LOCAL], reclaim_only=True), 0)
+            self.assertEqual(cli.run(config, [hosts.LOCAL]), 0)
         saved = next(Path(config['report_dir']).glob('*.md'))
         self.assertIn('Code: ' + label, saved.read_text())
         self.assertNotEqual(version.describe(self.checkout), label)

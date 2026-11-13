@@ -26,6 +26,17 @@ def describe(checkout=CHECKOUT):
     return label
 
 
+def revision(checkout=CHECKOUT):
+    try:
+        top = git(checkout, 'rev-parse', '--show-toplevel')
+        head = git(checkout, 'rev-parse', 'HEAD')
+    except (OSError, subprocess.SubprocessError):
+        return installed()
+    if top.returncode or head.returncode or Path(top.stdout.strip()).resolve() != Path(checkout).resolve():
+        return installed()
+    return head.stdout.strip()
+
+
 def installed():
     try:
         return 'installed coldcleaner ' + importlib.metadata.version('coldcleaner') + ' (not a Git checkout; revision unknown)'

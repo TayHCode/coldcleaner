@@ -36,6 +36,8 @@ class ReclaimTests(unittest.TestCase):
         self.config.update(nas_root=str(self.root / 'nas'), report_dir=str(self.root / 'reports'),
                            worktree_idle_days=0, archive_idle_days=0, live=['worktree', 'archive'])
         self.config['hosts']['test'] = dict(roots=[], archive=[])
+        retry = patch.object(cli, 'RETRY_SECONDS', 0)
+        retry.start(); self.addCleanup(retry.stop)
         self.entry = report.HostReport('test')
         self.protection = Mock()
         self.protection.reason.return_value = ''
@@ -44,9 +46,14 @@ class ReclaimTests(unittest.TestCase):
         self.env = patch.dict(os.environ, HOME=str(self.root), GIT_ALLOW_PROTOCOL='file',
                               GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
         self.env.start(); self.addCleanup(self.env.stop)
+        policy = self.root / '.config' / 'coldcleaner' / 'local.json'
+        policy.parent.mkdir(parents=True)
+        policy.write_text(json.dumps(dict(roots=[str(self.root)], archive=[str(self.root / '/'.join('*' * depth))
+                                                                           for depth in range(1, 5)])))
         original = reclaim_probe.main
         self.read_threads = reclaim_probe.threads
         self.read_codex = getattr(reclaim_probe, 'codex_threads', None)
+        self.read_claude = getattr(reclaim_probe, 'claude_threads', None)
         self.read_references = reclaim_probe.references
         self.read_drivers = getattr(reclaim_probe, 'drivers', None)
         for name, value in (('drivers', []), ('exited', False)):
@@ -59,7 +66,8 @@ class ReclaimTests(unittest.TestCase):
                 raise
             except Exception as exc:
                 raise RuntimeError(str(exc)) from None
-        for target, value in ((reclaim_probe, 'references'), (reclaim_probe, 'threads'), (reclaim_probe, 'codex_threads')):
+        for target, value in ((reclaim_probe, 'references'), (reclaim_probe, 'threads'), (reclaim_probe, 'codex_threads'),
+                              (reclaim_probe, 'claude_threads')):
             mock = patch.object(target, value, create=True, return_value=[])
             mock.start(); self.addCleanup(mock.stop)
         mock = patch.object(reclaim, 'probe', side_effect=local_probe)
@@ -79,10 +87,10 @@ class ReclaimTests(unittest.TestCase):
         return subprocess.run(['git', '-C', str(path), *args], check=True, capture_output=True,
                               text=True).stdout.strip()
 
-    def worktree(self):
+    def worktree(self, object_format='sha1'):
         repo = self.root / 'repo'; remote = self.root / 'remote.git'; work = self.root / 'work'
         repo.mkdir()
-        self.git(repo, 'init', '-b', 'main')
+        self.git(repo, 'init', '-b', 'main', '--object-format=' + object_format)
         self.git(repo, 'config', 'user.name', 'Test')
         self.git(repo, 'config', 'user.email', 'test@localhost')
         self.git(repo, 'config', 'commit.gpgsign', 'false')
@@ -90,7 +98,7 @@ class ReclaimTests(unittest.TestCase):
         (repo / '.gitignore').write_text('evidence/\n')
         self.git(repo, 'add', '.')
         self.git(repo, 'commit', '-m', 'initial')
-        self.git(self.root, 'init', '--bare', str(remote))
+        self.git(self.root, 'init', '--bare', '--object-format=' + object_format, str(remote))
         self.git(repo, 'remote', 'add', 'origin', str(remote))
         self.git(repo, 'push', 'origin', 'main')
         self.git(repo, 'worktree', 'add', '-b', 'done', str(work))
@@ -101,6 +109,57 @@ class ReclaimTests(unittest.TestCase):
             return reclaim.probe(self.host, 'repo', path=path, listing=listing), [], listing
         self.engine.proof = proof
         return repo, work
+
+    def test_removal_row_records_what_is_needed_to_restore_the_worktree(self):
+        repo, work = self.worktree()
+        head = self.git(work, 'rev-parse', 'HEAD')
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertFalse(work.exists(), self.entry.actions)
+        logged = [json.loads(line) for line in
+                  (Path(self.config['report_dir']) / 'reclaim-actions.jsonl').read_text().splitlines()]
+        row = next(row for row in logged if row['path'] == str(work))
+        self.assertEqual((row.get('head'), row.get('branch'), row.get('remote'),
+                          row.get('merged'), row.get('pull_requests')),
+                         (head, 'done', str(self.root / 'remote.git'), True, []))
+        self.git(repo, 'worktree', 'add', '-b', row['branch'], row['path'], row['head'])
+        self.assertEqual(self.git(work, 'rev-parse', 'HEAD'), row['head'])
+
+    def test_removal_retains_worktree_when_proved_branch_changes(self):
+        repo, work = self.worktree()
+        original = reclaim.probe
+        def switch_branch(host, operation, **request):
+            if operation == 'remove':
+                self.git(work, 'checkout', '-b', 'replacement')
+            return original(host, operation, **request)
+        self.engine.apply = True
+        with patch.object(reclaim, 'probe', side_effect=switch_branch), \
+             patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertTrue(work.exists(), self.entry.actions)
+        row = self.entry.actions[-1]
+        self.assertEqual((row['action'], row['reason']), ('skip', 'Git proof changed before removal'))
+        self.assertEqual(self.git(work, 'symbolic-ref', '--short', 'HEAD'), 'replacement')
+        self.assertEqual(self.git(repo, 'branch', '--list', '--format=%(refname:short)', 'done'), 'done')
+
+    def test_preview_row_records_closed_head_and_matching_pull_requests(self):
+        repo, work = self.worktree()
+        proof = self.engine.proof
+        head = self.git(work, 'rev-parse', 'HEAD')
+        def closed_proof(path, fresh=False):
+            state, _, listing = proof(path, fresh)
+            state['merged'] = False
+            return state, [dict(state='CLOSED', headRefOid=head, url='https://github.com/example/repo/pull/1'),
+                           dict(state='MERGED', headRefOid='other', url='https://github.com/example/repo/pull/2')], listing
+        self.engine.proof = closed_proof
+        self.engine.worktrees()
+        row = next(row for row in self.entry.actions if row['path'] == str(work))
+        self.assertEqual(row['action'], 'would remove worktree')
+        self.assertEqual((row.get('head'), row.get('branch'), row.get('remote'),
+                          row.get('merged'), row.get('pull_requests')),
+                         (head, 'done', str(self.root / 'remote.git'), False,
+                          ['https://github.com/example/repo/pull/1']))
 
     def test_completion_rejects_open_unpushed_and_unmerged_work(self):
         state = dict(dirty=False, stashes=False, published=True, merged=True, head='abc')
@@ -127,6 +186,13 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(prs, [upstream])
         state = dict(dirty=False, stashes=False, published=True, merged=True, head='abc')
         self.assertIn('open', reclaim.completion(state, prs))
+
+    def test_only_github_origins_name_a_repository(self):
+        for url in ['https://github.com/test/x', 'git@github.com:test/x.git', 'ssh://git@github.com/test/x']:
+            self.assertEqual(reclaim.repository(url), 'test/x')
+        for url in ['https://github.com.evil/test/x', 'https://github.com@evil/test/x', 'file:///github.com/test/x', '/local/repo']:
+            with self.assertRaisesRegex(ValueError, 'origin must be GitHub'):
+                reclaim.repository(url)
 
     def test_pr_lookup_rejects_same_head_from_another_repository(self):
         own = dict(state='CLOSED', headRefOid='abc', url='own',
@@ -194,7 +260,9 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(calls.count('sizes'), 1)
         self.assertEqual(self.entry.notes, [])
         text = report.render([self.entry])
-        self.assertIn(f"| UNIQUE: unpushed commits or incomplete origin proof | 1 | {rows[str(unique)]['bytes']} |", text)
+        head = self.git(unique, 'rev-parse', 'HEAD')[:12]
+        remote = self.root / 'remote.git'
+        self.assertIn(f"| UNIQUE: unpushed commits or incomplete origin proof: head {head} is not on {remote} | 1 | {rows[str(unique)]['bytes']} |", text)
         largest = text.split('Largest 20 skipped:')[1]
         self.assertLess(largest.index(str(dirty)), largest.index(str(unique)))
 
@@ -372,6 +440,7 @@ class ReclaimTests(unittest.TestCase):
     def inventory_failure(self, platform, run):
         with patch.object(reclaim_probe.sys, 'platform', platform), patch.object(
                 reclaim_probe.os, 'geteuid', return_value=1000), patch.object(
+                reclaim_probe, 'installed_scan', return_value=True), patch.object(
                 reclaim_probe.subprocess, 'run', side_effect=run):
             error = self.failure(self.read_references)
         return type(error), str(error)
@@ -380,7 +449,9 @@ class ReclaimTests(unittest.TestCase):
         expected = (ValueError, 'IN USE: process inventory needs passwordless sudo (see README#sudo)')
         for platform, encode in (('linux', str), ('darwin', str.encode)):
             for stderr in ('sudo: a password is required\n', 'sudo: sorry, user alice is not allowed to execute x\n',
-                           'sudo: unable to send audit message: Operation not permitted\nsudo: a password is required\n'):
+                           'sudo: unable to send audit message: Operation not permitted\nsudo: a password is required\n',
+                           "sudo: I'm sorry stranger. I'm afraid I can't do that\n",
+                           'sudo: interactive authentication is required\n'):
                 refused = Mock(returncode=1, stdout=encode(''), stderr=encode(stderr))
                 with self.subTest(platform=platform, stderr=stderr):
                     self.assertEqual(self.inventory_failure(platform, lambda *args, **kwargs: refused), expected)
@@ -407,12 +478,14 @@ class ReclaimTests(unittest.TestCase):
         with patch.object(reclaim_probe, 'SCAN_PATH', str(installed), create=True), patch.object(
                 reclaim_probe.os, 'geteuid', return_value=1000), patch.object(
                 reclaim_probe.subprocess, 'run', side_effect=run):
-            installed.write_text(reclaim_probe.PROC_SCAN + '\n# older release\n')
-            self.read_references()
+            for stale in (None, reclaim_probe.PROC_SCAN + '\n# older release\n'):
+                if stale is not None:
+                    installed.write_text(stale)
+                error = self.failure(self.read_references)
+                self.assertEqual((type(error), str(error)), (ValueError, reclaim_probe.NEEDS_SUDO))
             installed.write_text(reclaim_probe.PROC_SCAN)
             self.read_references()
-        self.assertEqual(calls, [['sudo', '-n', 'python3', '-c', reclaim_probe.PROC_SCAN, '/proc'],
-                                 ['sudo', '-n', 'python3', '-I', str(installed), '/proc']])
+        self.assertEqual(calls, [['sudo', '-n', 'python3', '-I', str(installed), '/proc']])
         readme = (Path(__file__).parents[1] / 'README.md').read_text()
         self.assertIn('\n## Sudo\n', readme)
         self.assertIn('NOPASSWD: /usr/bin/python3 -I /usr/local/libexec/coldcleaner-proc-scan.py /proc\n', readme)
@@ -697,6 +770,34 @@ class ReclaimTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'running process'):
             reclaim_probe.guard(job, activity=dict(threads=[], references=found))
 
+    def test_every_logged_row_names_the_policy_it_ran_under(self):
+        with patch.object(reclaim.version, 'revision', return_value='c0de' * 10):
+            self.engine = reclaim.Reclaimer(self.host, self.config, True, self.protection, self.entry)
+        repo, work = self.worktree()
+        stamp = time.time() - 8 * 86400
+        old = self.root / 'evidence-old'; old.mkdir(); (old / 'unique').write_text('keep a copy')
+        for path in (old / 'unique', old):
+            os.utime(path, (stamp, stamp))
+        fresh = self.root / 'evidence-new'; fresh.mkdir(); (fresh / 'unique').write_text('still in use')
+        pattern = str(self.root / 'evidence-*')
+        self.config['hosts']['test']['archive'] = [pattern]
+        self.config['archive_idle_days'] = 5
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+            self.engine.archives()
+        logged = {row['path']: row for row in (json.loads(line) for line in
+                  (Path(self.config['report_dir']) / 'reclaim-actions.jsonl').read_text().splitlines())}
+        policy = dict(rules_sha256=hashlib.sha256((Path(__file__).parent / 'fixtures' / 'rules.toml').read_bytes()).hexdigest(),
+                      code='c0de' * 10)
+        expected = {
+            str(work): dict(action='remove worktree and local branch', rule='test.roots:' + str(self.root), idle_days=0),
+            str(old): dict(action='archive and remove', rule='test.archive:' + pattern, idle_days=reclaim.retention(str(old), 5)),
+            str(fresh): dict(action='skip', rule='test.archive:' + pattern, idle_days=reclaim.retention(str(fresh), 5)),
+        }
+        for path, fields in expected.items():
+            row = logged[path]
+            self.assertEqual({key: row.get(key) for key in (*fields, *policy)}, {**fields, **policy}, row)
+
     def test_real_worktree_preview_preserves_then_apply_removes_branch(self):
         repo, work = self.worktree()
         with patch.object(protect, 'collect', return_value=self.protection):
@@ -770,8 +871,18 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(self.git(repo, 'rev-parse', 'refs/heads/done'),
                          self.git(other, 'rev-parse', 'HEAD'))
         self.assertEqual(self.entry.actions[-1]['action'], 'remove worktree; retain local branch')
+        row = self.entry.actions[-1]
+        self.assertEqual(row.get('head'), self.git(other, 'rev-parse', 'HEAD'))
+        self.git(repo, 'worktree', 'add', '--detach', row['path'], row['head'])
+        self.assertEqual(self.git(work, 'rev-parse', 'HEAD'), row['head'])
 
-    def test_unique_head_and_branch_reflogs_retain_worktrees(self):
+    def restored_copy(self, path):
+        record = next(item for item in store._read_index(self.root / 'nas') if item.source_path == str(path))
+        restored = self.root / ('restored-' + path.name)
+        store.restore(record.id, self.root / 'nas', to=str(restored))
+        return restored
+
+    def test_unique_head_and_branch_reflogs_are_bundled_before_removal(self):
         repo, work = self.worktree()
         head = self.git(work, 'rev-parse', 'HEAD')
         self.engine.apply = True
@@ -787,13 +898,59 @@ class ReclaimTests(unittest.TestCase):
                     self.git(candidate, 'reflog', 'expire', '--expire=all', 'HEAD')
                 else:
                     self.git(candidate, 'checkout', '--detach')
-                with patch.object(protect, 'collect', return_value=self.protection):
+                with patch.object(protect, 'collect', return_value=self.protection), contextlib.chdir(self.root):
                     self.engine.worktrees()
-                self.assertTrue(candidate.is_dir(), self.entry.actions)
-                ref = 'HEAD' if name == 'head-history' else 'refs/heads/' + name
-                self.assertIn(unique, self.git(candidate, 'reflog', 'show', '--format=%H', ref))
+                self.assertFalse(candidate.exists(), self.entry.actions)
                 action = next(row for row in self.entry.actions if row['path'] == str(candidate))
-                self.assertIn('reflog', action['reason'])
+                self.assertIn('reflog commits bundled', action['reason'])
+                restored = self.restored_copy(candidate)
+                self.assertEqual(self.git(restored, 'rev-parse', 'refs/coldcleaner/reflog/' + unique), unique)
+                self.assertEqual(self.git(restored, 'rev-parse', 'HEAD'), head)
+
+    def test_amended_commit_is_restored_from_the_bundle_after_removal(self):
+        self.amended_commit_round_trip('sha1')
+
+    def test_amended_commit_in_a_sha256_repository_is_restored_from_the_bundle(self):
+        self.amended_commit_round_trip('sha256')
+
+    def amended_commit_round_trip(self, object_format):
+        repo, work = self.worktree(object_format)
+        self.assertEqual(len(self.git(work, 'rev-parse', 'HEAD')), 40 if object_format == 'sha1' else 64)
+        (work / 'tracked').write_text('draft')
+        self.git(work, 'commit', '-am', 'draft')
+        draft = self.git(work, 'rev-parse', 'HEAD')
+        self.git(work, 'commit', '--amend', '-m', 'final')
+        final = self.git(work, 'rev-parse', 'HEAD')
+        self.git(work, 'push', 'origin', 'done', 'done:main')
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertIn('unique reflog history', self.entry.actions[-1]['reason'])
+        self.assertTrue(work.exists())
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection), contextlib.chdir(self.root):
+            self.engine.worktrees()
+        self.assertFalse(work.exists(), self.entry.actions)
+        restored = self.restored_copy(work)
+        self.assertEqual(self.git(restored, 'rev-parse', 'HEAD'), final)
+        self.assertEqual(self.git(restored, 'show', '-s', '--format=%s', draft), 'draft')
+        self.assertEqual(self.git(restored, 'rev-parse', 'refs/coldcleaner/reflog/' + draft), draft)
+
+    def test_removal_refuses_unique_reflog_history_that_was_not_bundled(self):
+        repo, work = self.worktree()
+        head = self.git(work, 'rev-parse', 'HEAD')
+        (work / 'tracked').write_text('unique')
+        self.git(work, 'commit', '-am', 'unique')
+        unique = self.git(work, 'rev-parse', 'HEAD')
+        self.git(work, 'reset', '--hard', head)
+        listing = self.git(repo, 'ls-remote', str(self.root / 'remote.git'))
+        self.assertEqual(reclaim.probe(self.host, 'repo', path=str(work), listing=listing)['reflog'], [unique])
+        for request in (dict(), dict(manifest={}, security={}, reflog=[])):
+            with self.subTest(request=request), self.assertRaisesRegex(ValueError, 'Git proof changed before removal'):
+                reclaim.probe(self.host, 'remove', path=str(work), head=head, branch='done',
+                              remote=str(self.root / 'remote.git'), listing=listing, **request)
+        self.assertTrue(work.exists())
+        with self.assertRaisesRegex(ValueError, 'invalid reflog commit'):
+            reclaim_probe.reflog_ref('HEAD')
 
     def test_published_reflog_history_allows_worktree_cleanup(self):
         repo, work = self.worktree()
@@ -808,6 +965,44 @@ class ReclaimTests(unittest.TestCase):
         self.assertFalse(work.exists(), self.entry.actions)
         self.assertEqual(self.entry.actions[-1]['action'], 'remove worktree and local branch')
 
+    def test_stash_in_the_main_checkout_does_not_hold_a_clean_linked_worktree(self):
+        repo, work = self.worktree()
+        (repo / 'tracked').write_text('stashed')
+        self.git(repo, 'stash')
+        stash = self.git(repo, 'rev-parse', 'refs/stash')
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertFalse(work.exists(), self.entry.actions)
+        self.assertEqual(self.git(repo, 'rev-parse', 'refs/stash'), stash)
+        self.assertTrue(reclaim.probe(self.host, 'repo', path=str(repo))['stashes'])
+        with self.assertRaisesRegex(ValueError, 'uncommitted work or stashes'):
+            self.engine.safe(str(repo), archive=True)
+        self.assertTrue(repo.exists())
+        self.assertEqual(self.git(repo, 'rev-parse', 'refs/stash'), stash)
+        self.git(repo, 'init', '--separate-git-dir', str(self.root / 'metadata'))
+        self.git(repo, 'config', 'core.worktree', str(repo))
+        self.assertTrue((repo / '.git').is_file())
+        self.assertTrue(reclaim.probe(self.host, 'repo', path=str(repo))['stashes'])
+        self.engine.worktrees()
+        self.assertIn('uncommitted work or stashes', self.entry.actions[-1]['reason'])
+        with self.assertRaisesRegex(ValueError, 'registered worktree must use Git retirement'):
+            self.engine.safe(str(repo), archive=True)
+        self.assertEqual(self.git(repo, 'rev-parse', 'refs/stash'), stash)
+        self.shared_stash_keeps_other_worktree_holds_strict(repo, stash)
+
+    def test_unpushed_skip_names_the_remote_that_was_checked(self):
+        repo, work = self.worktree()
+        (work / 'tracked').write_text('local only')
+        self.git(work, 'commit', '-am', 'local only')
+        head = self.git(work, 'rev-parse', 'HEAD')
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        action = next(row for row in self.entry.actions if row['path'] == str(work))
+        self.assertEqual(action['action'], 'skip')
+        self.assertIn('is not on ' + str(self.root / 'remote.git'), action['reason'])
+        self.assertIn(head[:12], action['reason'])
+
     def test_real_dirty_and_unpushed_worktrees_are_retained(self):
         repo, work = self.worktree()
         (work / 'tracked').write_text('unique dirty data')
@@ -819,6 +1014,39 @@ class ReclaimTests(unittest.TestCase):
         self.engine.worktrees()
         self.assertTrue(work.exists())
         self.assertIn('unpushed', self.entry.actions[-1]['reason'])
+
+    def shared_stash_keeps_other_worktree_holds_strict(self, repo, stash):
+        work = self.root / 'work'
+        self.git(repo, 'worktree', 'add', '-b', 'done', str(work))
+        original = self.engine.proof
+        self.engine.apply = True
+        for hold in ('dirty', 'unpushed', 'open', 'process', 'thread'):
+            with self.subTest(hold=hold):
+                self.engine.activity = None
+                def proof(path, fresh=False):
+                    state, prs, listing = original(path, fresh)
+                    if hold == 'open':
+                        prs = [dict(state='OPEN', headRefOid=state['head'])]
+                    elif hold in ('process', 'thread'):
+                        prs = [dict(state='CLOSED', headRefOid=state['head'])]
+                    return state, prs, listing
+                self.engine.proof = proof
+                if hold in ('dirty', 'unpushed'):
+                    (work / 'tracked').write_text(hold)
+                if hold == 'unpushed':
+                    self.git(work, 'commit', '-am', 'unpushed')
+                with patch.object(reclaim_probe, 'references', return_value=[str(work)] if hold == 'process' else []), \
+                        patch.object(reclaim_probe, 'threads', return_value=[str(work)] if hold == 'thread' else []):
+                    self.engine.worktrees()
+                self.assertTrue(work.exists(), self.entry.actions)
+                expected = dict(dirty='uncommitted', unpushed='unpushed', open='open pull request',
+                                process='running process', thread='T3 thread')[hold]
+                self.assertIn(expected, self.entry.actions[-1]['reason'])
+                if hold == 'dirty':
+                    self.git(work, 'restore', 'tracked')
+                if hold == 'unpushed':
+                    self.git(work, 'push', 'origin', 'done')
+                self.assertEqual(self.git(repo, 'rev-parse', 'refs/stash'), stash)
 
     def test_merged_worktree_uses_existing_one_day_grace(self):
         repo, work = self.worktree()
@@ -1100,9 +1328,9 @@ class ReclaimTests(unittest.TestCase):
 
     def test_temp_retention_cache_exclusion_and_vm_disks_are_retained(self):
         self.assertEqual(reclaim.retention('/tmp/test-output', 4), 7)
-        self.assertEqual(reclaim.retention('C:\\Users\\name\\AppData\\Local\\Temp\\job', 4), 7)
+        self.assertEqual(reclaim.retention('C:\\Users\\user\\AppData\\Local\\Temp\\job', 4), 7)
         self.assertEqual(reclaim.retention('/evidence', 14), 14)
-        for path in ('/tmp/node-compile-cache', '/home/name/.cache/uv', 'C:\\Users\\name\\npm-cache'):
+        for path in ('/tmp/node-compile-cache', '/home/user/.cache/uv', 'C:\\Users\\user\\npm-cache'):
             self.assertTrue(reclaim.package_cache(path))
         path = self.root / 'base.vhdx'; path.write_bytes(b'VM state')
         with self.assertRaisesRegex(ValueError, 'hypervisor dependency'):
@@ -1227,6 +1455,14 @@ class ReclaimTests(unittest.TestCase):
         self.assertNotIn(str(work), discovered['paths'])
         self.assertTrue(work.exists())
 
+    def test_excluded_package_cache_row_has_no_idle_window(self):
+        cache = self.root / '.cache'; cache.mkdir(); (cache / 'package').write_text('leave alone')
+        self.config['hosts']['test']['archive'] = [str(cache)]
+        self.engine.archives()
+        row = self.entry.actions[-1]
+        self.assertEqual((row['action'], row['reason'], row['rule'], row['idle_days']),
+                         ('skip', 'package caches are excluded', 'test.archive:' + str(cache), None))
+
     def test_nested_package_cache_retains_the_entire_candidate(self):
         source = self.root / 'evidence'; source.mkdir()
         cache = source / 'nested' / '.npm'; cache.mkdir(parents=True)
@@ -1330,7 +1566,6 @@ class ReclaimTests(unittest.TestCase):
         selected = self.root / 'member'
         store.restore(record.id, self.root / 'nas', to=str(selected), member='evidence/unique')
         self.assertEqual((selected / 'unique').read_bytes(), b'unique\x00\xff')
-        self.assertEqual(store.enforce_cap(self.root / 'nas', 0, apply=True), [])
         self.assertTrue(Path(record.archive_path).exists())
         with tarfile.open(record.archive_path, 'r:zst') as archive:
             self.assertEqual(archive.extractfile('evidence/unique').read(), b'unique\x00\xff')
@@ -1355,14 +1590,99 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual((source / 'unique').read_text(), 'keep')
         self.assertEqual(len(list((self.root / 'nas').rglob('*.tar.zst'))), 1)
 
-    def test_real_archive_preview_and_apply_never_touch_cache_or_nas_expiry(self):
+    def test_copy_interrupted_before_indexing_is_retired_by_the_next_attempt(self):
+        source = self.root / 'evidence'; source.mkdir(); (source / 'unique').write_text('keep')
+        legacy = self.root / 'nas/test/2026-01-01' / ('f' * 32); legacy.mkdir(parents=True)
+        (legacy / 'old.tar.zst').write_bytes(b'unindexed, not ours')
+        with patch.object(store, '_write_index', side_effect=OSError('NAS went away')), self.assertRaises(OSError):
+            reclaim.preserve(self.host, str(source), self.root / 'nas', lambda: None)
+        unlink = Path.unlink
+        def stuck(path, *args, **kwargs):
+            if path.name.endswith('.tar.zst'):
+                raise OSError('NAS unlink failed')
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', autospec=True, side_effect=stuck), self.assertRaises(OSError):
+            reclaim.preserve(self.host, str(source), self.root / 'nas', lambda: None)
+        record, _, _ = reclaim.preserve(self.host, str(source), self.root / 'nas', lambda: None)
+        archives = sorted((self.root / 'nas').rglob('*.tar.zst'))
+        self.assertEqual(archives, sorted([Path(record.archive_path), legacy / 'old.tar.zst']))
+        self.assertEqual(list((self.root / 'nas').rglob(reclaim.ATTEMPT)), [])
+        self.assertEqual([item.id for item in store._read_index(self.root / 'nas')], [record.id])
+
+    def test_preserve_does_not_visit_every_archive_already_on_the_nas(self):
+        nas = self.root / 'nas'
+        records = []
+        for number in range(300):
+            ident = f'{number:032x}'
+            directory = nas / 'test/2026-01-01' / ident; directory.mkdir(parents=True)
+            (directory / (ident + '.tar.zst')).write_bytes(b'old')
+            records.append(store.Record(ident, '2026-01-01T00:00:00+00:00', 'test', f'/old/{number}',
+                                        str(directory / (ident + '.tar.zst')), 3, 3, 1, 'stored'))
+        store._write_index(nas, records)
+        source = self.root / 'evidence'; source.mkdir(); (source / 'unique').write_text('keep')
+        visited = []
+        def counted(function):
+            def wrapper(path, *args, **kwargs):
+                if str(path).startswith(str(nas / 'test/2026-01-01')):
+                    visited.append(path)
+                return function(path, *args, **kwargs)
+            return wrapper
+        with patch.object(os, 'scandir', counted(os.scandir)), \
+                patch.object(os.path, 'realpath', counted(os.path.realpath)), \
+                patch.object(os.path, 'lexists', counted(os.path.lexists)):
+            record, _, _ = reclaim.preserve(self.host, str(source), nas, lambda: None)
+        self.assertEqual(record.source_path, str(source))
+        self.assertLess(len(visited), 30)
+        for name in ('..+2026-01-01+' + 'a' * 32, 'test+not-a-date+' + 'a' * 32, 'test+2026-01-01+x'):
+            (nas / reclaim.PENDING / name).touch()
+            with self.assertRaisesRegex(RuntimeError, 'unexpected NAS attempt entry'):
+                reclaim.preserve(self.host, str(self.root / 'evidence'), nas, lambda: None)
+            (nas / reclaim.PENDING / name).unlink()
+        self.assertTrue((nas / 'test/2026-01-01' / f'{0:032x}').is_dir())
+
+    def test_verified_copy_indexed_before_an_interrupted_removal_is_reused_on_retry(self):
+        repo, work = self.worktree()
+        evidence = work / 'evidence/result.bin'; evidence.parent.mkdir(); evidence.write_bytes(b'unique')
+        abort = lambda: (_ for _ in ()).throw(ValueError('new activity'))
+        with self.assertRaisesRegex(ValueError, 'new activity'):
+            reclaim.preserve(self.host, str(work), self.root / 'nas', abort)
+        first = store._read_index(self.root / 'nas')[0]
+        store._manifest_path(Path(first.archive_path)).unlink()
+        record, _, _ = reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+        self.assertEqual(record.id, first.id)
+        self.assertEqual([item.matches for item in store.find('result.bin', self.root / 'nas')],
+                         [('work/evidence/result.bin',)])
+        self.assertEqual(len(list((self.root / 'nas').rglob('*.tar.zst'))), 1)
+        bundle = Path(first.archive_path).parent / 'head.bundle'
+        original = bundle.read_bytes()
+        bundle.write_bytes(original + b'\0')
+        with self.assertRaisesRegex(RuntimeError, 'bundle SHA-256'):
+            reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+        bundle.write_bytes(original)
+        receipt = Path(first.archive_path).with_suffix('.sha256.json')
+        receipt.write_text(json.dumps(dict(json.loads(receipt.read_text()), source=str(self.root / 'elsewhere'))))
+        swapped, _, _ = reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+        self.assertNotEqual(swapped.id, first.id)
+        self.git(work, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+                 'commit', '--allow-empty', '-m', 'new head')
+        moved, _, _ = reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+        evidence.write_bytes(b'changed')
+        changed, _, _ = reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+        self.assertEqual(len({first.id, moved.id, changed.id}), 3)
+        Path(changed.archive_path).write_bytes(b'x' * changed.archive_bytes)
+        with self.assertRaisesRegex(RuntimeError, 'test-read'):
+            reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+        Path(changed.archive_path).with_suffix('.sha256.json').write_text('{}')
+        with self.assertRaisesRegex(RuntimeError, 'unreadable archive receipt'):
+            reclaim.preserve(self.host, str(work), self.root / 'nas', lambda: None)
+
+    def test_real_archive_preview_and_apply_never_touch_other_data_or_nas_expiry(self):
         source = self.root / 'evidence'; source.mkdir(); (source / 'unique').write_text('keep a copy')
         cache = self.root / 'package-cache'; cache.mkdir(); (cache / 'data').write_text('leave alone')
         stamp = time.time() - 8 * 86400
         for path in (source / 'unique', source):
             os.utime(path, (stamp, stamp))
         self.config['hosts']['test']['archive'] = [str(source)]
-        self.config['hosts']['test']['cache'] = [dict(path=str(cache))]
         with patch.object(protect, 'collect', return_value=self.protection):
             self.engine.archives()
             self.assertTrue(source.exists())
@@ -1372,6 +1692,567 @@ class ReclaimTests(unittest.TestCase):
         self.assertFalse(source.exists(), self.entry.actions)
         self.assertEqual((cache / 'data').read_text(), 'leave alone')
         self.assertIn('SHA-256 verified', self.entry.actions[-1]['reason'])
+
+    def aged(self, name, days):
+        source = self.root / 'evidence' / name; source.mkdir(parents=True); (source / 'data').write_text(name)
+        stamp = time.time() - days * 86400
+        for path in (source / 'data', source):
+            os.utime(path, (stamp, stamp))
+        return source
+
+    def archive_now(self):
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        return {Path(row['path']).name: (row['action'], row['idle_days']) for row in self.entry.actions}
+
+    def test_thirty_day_pattern_keeps_day_29_and_archives_day_31(self):
+        young, old = self.aged('29-days', 29), self.aged('31-days', 31)
+        self.config['hosts']['test']['archive'] = [dict(path=str(self.root / 'evidence' / '*'), days=30)]
+        rows = self.archive_now()
+        self.assertTrue(young.exists())
+        self.assertFalse(old.exists(), rows)
+        self.assertEqual(rows['31-days'], ('archive and remove', 30))
+        self.assertEqual(rows['29-days'][1], 30)
+        self.assertNotEqual(rows['29-days'][0], 'archive and remove')
+
+    def test_plain_pattern_still_uses_archive_idle_days(self):
+        self.config['archive_idle_days'] = 30
+        young, old = self.aged('29-days', 29), self.aged('31-days', 31)
+        self.config['hosts']['test']['archive'] = [str(self.root / 'evidence' / '*')]
+        rows = self.archive_now()
+        self.assertEqual((young.exists(), old.exists()), (True, False), rows)
+
+    def test_host_and_entry_excludes_are_never_candidates(self):
+        sources = [self.aged(name, 31) for name in ('host-kept', 'entry-kept', 'holds-kept', 'gone')]
+        (sources[2] / 'inner').mkdir()
+        self.config['hosts']['test'].update(
+            exclude=[str(self.root / 'evidence' / 'host-*')],
+            archive=[dict(path=str(self.root / 'evidence' / '*'), days=30,
+                          exclude=[str(sources[1]), str(sources[2] / 'inner')])])
+        rows = self.archive_now()
+        self.assertEqual([source.exists() for source in sources], [True, True, True, False], rows)
+        self.assertEqual(set(rows), {'gone'})
+
+    def test_entry_exclude_holds_against_every_matching_pattern(self):
+        kept = self.aged('keep-me', 31)
+        self.config['hosts']['test']['archive'] = [
+            dict(path=str(self.root / 'evidence' / '*'), exclude=[str(kept)]), str(self.root / 'evidence' / 'keep-*')]
+        rows = self.archive_now()
+        self.assertTrue(kept.exists(), rows)
+        self.assertEqual(rows, {})
+
+    def test_overlapping_patterns_use_the_longest_retention(self):
+        young = self.aged('29-days', 29)
+        self.config['hosts']['test']['archive'] = [
+            dict(path=str(self.root / 'evidence' / '*'), days=4), dict(path=str(young), days=30)]
+        rows = self.archive_now()
+        self.assertTrue(young.exists(), rows)
+        self.assertEqual(rows['29-days'][1], 30)
+
+    def test_nested_entry_rules_hold_their_parent_match(self):
+        parent = self.aged('proj', 31)
+        kept = parent / 'keep'; kept.mkdir(); other = parent / 'other'; other.mkdir()
+        stamp = time.time() - 31 * 86400
+        for path in (kept, other, parent):
+            os.utime(path, (stamp, stamp))
+        self.config['hosts']['test']['archive'] = [
+            dict(path=str(parent), days=4), dict(path=str(parent / '*'), exclude=[str(kept)])]
+        rows = self.archive_now()
+        self.assertEqual((parent.exists(), kept.exists(), other.exists()), (True, True, False), rows)
+
+    def test_nested_entry_with_longer_days_holds_its_parent(self):
+        parent = self.aged('proj', 10)
+        self.config['hosts']['test']['archive'] = [
+            dict(path=str(parent), days=4), dict(path=str(parent / 'data'), days=30)]
+        rows = self.archive_now()
+        self.assertTrue(parent.exists(), rows)
+        self.assertEqual(rows['proj'][1], 30)
+
+    def test_folder_moved_into_a_match_after_the_scan_keeps_it(self):
+        parent = self.aged('proj', 31)
+        moved = self.aged('young', 10)
+        self.config['hosts']['test']['archive'] = [
+            dict(path=str(parent), days=4), dict(path=str(parent / 'young'), days=30)]
+        original = reclaim.preserve
+        def move_then_copy(*args):
+            moved.rename(parent / 'young')
+            return original(*args)
+        with patch.object(reclaim, 'preserve', move_then_copy):
+            rows = self.archive_now()
+        self.assertTrue((parent / 'young').exists(), rows)
+        self.assertEqual(rows['proj'][0], 'skip')
+        self.assertIn('recent', self.entry.actions[-1]['reason'])
+
+    def test_exclude_reached_through_a_symlink_alias_holds(self):
+        kept = self.aged('kept', 31)
+        alias = self.root / 'alias'; alias.symlink_to(kept)
+        self.config['hosts']['test']['exclude'] = [str(alias)]
+        self.config['hosts']['test']['archive'] = [str(self.root / 'evidence' / '*')]
+        rows = self.archive_now()
+        self.assertTrue(kept.exists(), rows)
+
+    def test_exclude_created_after_the_scan_stops_removal(self):
+        source = self.aged('late', 31)
+        self.config['hosts']['test']['archive'] = [dict(path=str(source), exclude=[str(source / 'keep')])]
+        original = reclaim.preserve
+        def copy_then_exclude(*args):
+            saved = original(*args)
+            (source / 'keep').mkdir()
+            stamp = time.time() - 31 * 86400
+            for path in (source / 'keep', source):
+                os.utime(path, (stamp, stamp))
+            return saved
+        with patch.object(reclaim, 'preserve', copy_then_exclude):
+            self.archive_now()
+        self.assertTrue((source / 'keep').exists())
+        self.assertEqual((self.entry.actions[-1]['action'], self.entry.actions[-1]['reason']), ('skip', 'excluded by rules'))
+
+    def limited_archives(self, sizes, **limits):
+        sources = []
+        stamp = time.time() - 8 * 86400
+        for index, size in enumerate(sizes):
+            source = self.root / f'evidence-{index}'; source.mkdir(); (source / 'data').write_text('x' * size)
+            for path in (source / 'data', source):
+                os.utime(path, (stamp, stamp))
+            sources.append(source)
+        self.config['hosts']['test'].update(archive=[str(source) for source in sources], **limits)
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        return sources, [(row['action'], row['reason']) for row in self.entry.actions]
+
+    def planned(self, source, **entry):
+        self.config['hosts']['test']['archive'] = [dict(path=str(source), **entry)]
+        self.entry = self.engine.report = report.HostReport('test')
+        self.engine.apply = False
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        plan = Path(self.config['report_dir']) / 'one.plan.json'
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        reclaim.write_plan(plan, [self.entry], self.config.get('rules_sha256'))
+        self.entry = self.engine.report = report.HostReport('test')
+        return plan, json.loads(plan.read_text())['items']
+
+    def approve(self, *argv):
+        stdout = io.StringIO()
+        with patch.object(rules, 'load', return_value=self.config), contextlib.redirect_stdout(stdout):
+            return cli.main(['approve', *map(str, argv)]), stdout.getvalue()
+
+    def test_dry_run_plan_lists_candidates_with_stable_ids_and_reasons(self):
+        source = self.aged('gated', 31)
+        _, first = self.planned(source, approval=True)
+        _, second = self.planned(source, approval=True)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first, second)
+        item = first[0]
+        self.assertRegex(item['id'], r'^[0-9a-f]{16}$')
+        self.assertEqual((item['host'], item['tier'], item['path'], item['approval']), ('test', 'archive', str(source), True))
+        self.assertIn('NAS', item['reason'])
+
+    def test_unapproved_item_on_an_approval_rule_is_untouched(self):
+        source = self.aged('gated', 31)
+        self.planned(source, approval=True)
+        rows = self.archive_now()
+        self.assertTrue(source.exists(), rows)
+        self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_NEEDED)
+
+    def test_approved_item_is_acted_on_once(self):
+        source = self.aged('gated', 31)
+        plan, items = self.planned(source, approval=True)
+        self.assertEqual(self.approve(plan, items[0]['id'])[0], 0)
+        rows = self.archive_now()
+        self.assertFalse(source.exists(), rows)
+        self.assertEqual(rows['gated'][0], 'archive and remove')
+        self.assertNotIn(items[0]['id'], json.loads((Path(self.config['report_dir']) / reclaim.APPROVALS).read_text()))
+
+    def test_removal_is_logged_even_if_the_approval_cannot_be_consumed(self):
+        source = self.aged('gated', 31)
+        plan, _ = self.planned(source, approval=True)
+        self.approve(plan, 'all')
+        with patch.object(reclaim.Reclaimer, 'consume', side_effect=OSError('read-only')):
+            self.archive_now()
+        self.assertFalse(source.exists())
+        logged = [json.loads(line)['action'] for line in
+                  (Path(self.config['report_dir']) / 'reclaim-actions.jsonl').read_text().splitlines()]
+        self.assertEqual(logged[-2:], ['archive and remove', 'error'])
+
+    def test_approved_item_that_changed_since_the_plan_is_skipped(self):
+        source = self.aged('gated', 31)
+        plan, _ = self.planned(source, approval=True)
+        self.assertEqual(self.approve(plan, 'all')[0], 0)
+        (source / 'data').write_text('changed after approval')
+        stamp = time.time() - 31 * 86400
+        for path in (source / 'data', source):
+            os.utime(path, (stamp, stamp))
+        rows = self.archive_now()
+        self.assertTrue(source.exists(), rows)
+        self.assertEqual((source / 'data').read_text(), 'changed after approval')
+        self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_STALE)
+
+    def test_same_size_rewrite_with_an_old_mtime_is_stale(self):
+        source = self.aged('gated', 31)
+        (source / 'other').write_text('x')
+        stamp = time.time() - 31 * 86400
+        for path in (source / 'other', source):
+            os.utime(path, (stamp, stamp))
+        plan, _ = self.planned(source, approval=True)
+        self.approve(plan, 'all')
+        before = (source / 'data').stat()
+        (source / 'data').write_text('GATED')
+        os.utime(source / 'data', ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.archive_now()
+        self.assertEqual((source / 'data').read_text(), 'GATED')
+        self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_STALE)
+
+    def test_worktree_changed_at_the_removal_boundary_is_kept(self):
+        _, work = self.worktree()
+        self.config['approval'] = ['worktree']
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        plan = Path(self.config['report_dir']) / 'one.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.approve(plan, 'all')
+        self.entry = self.engine.report = report.HostReport('test')
+        original = reclaim.probe
+        def touch_then(host, operation, **request):
+            if operation == 'remove':
+                stamp = (work / 'tracked').stat().st_mtime_ns
+                os.utime(work / 'tracked', ns=(stamp, stamp))
+            return original(host, operation, **request)
+        self.engine.apply = True
+        with patch.object(reclaim, 'probe', side_effect=touch_then), \
+             patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertTrue(work.exists(), self.entry.actions)
+        self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_STALE)
+
+    def test_item_changed_after_its_fresh_recheck_is_skipped(self):
+        source = self.aged('gated', 31)
+        plan, _ = self.planned(source, approval=True)
+        self.approve(plan, 'all')
+        original = reclaim.preserve
+        def change_then_copy(host, path, root, before_remove, *rest):
+            (source / 'late').write_text('new')
+            stamp = time.time() - 31 * 86400
+            for item in (source / 'late', source):
+                os.utime(item, (stamp, stamp))
+            return original(host, path, root, before_remove, *rest)
+        with patch.object(reclaim, 'preserve', change_then_copy):
+            self.archive_now()
+        self.assertTrue((source / 'late').exists())
+        self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_STALE)
+
+    def clones(self, *names):
+        bare = self.root / 'remote.git'; seed = self.root / 'seed'
+        self.git(self.root, 'init', '--bare', '-b', 'main', str(bare))
+        seed.mkdir(); self.git(seed, 'init', '-b', 'main')
+        for key, value in (('user.name', 'Test'), ('user.email', 'test@localhost'), ('commit.gpgsign', 'false')):
+            self.git(seed, 'config', key, value)
+        (seed / '.gitignore').write_text('evidence/\n'); self.git(seed, 'add', '.'); self.git(seed, 'commit', '-m', 'initial')
+        self.git(seed, 'push', str(bare), 'main')
+        projects = self.root / 'projects'; projects.mkdir()
+        made = []
+        for name in names:
+            self.git(projects, 'clone', '-q', str(bare), name)
+            for key, value in (('user.name', 'Test'), ('user.email', 'test@localhost'), ('commit.gpgsign', 'false')):
+                self.git(projects / name, 'config', key, value)
+            made.append(projects / name)
+        self.config['hosts']['test']['roots'] = [str(projects)]
+        def proof(path, fresh=False):
+            listing = self.git(self.root, 'ls-remote', str(bare))
+            return reclaim.probe(self.host, 'repo', path=path, listing=listing), [], listing
+        self.engine.proof = proof
+        mock = patch.object(reclaim, 'repository', return_value='test/tool')
+        mock.start(); self.addCleanup(mock.stop)
+        return made
+
+    def clone_run(self, apply=False):
+        self.entry = self.engine.report = report.HostReport('test')
+        self.engine.apply = apply
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.clones()
+        return {Path(row['path']).name: (row['action'], row['reason']) for row in self.entry.actions}
+
+    def test_redundant_clone_is_removed_after_approval_and_a_verified_nas_copy(self):
+        kept, extra = self.clones('tool', 'tool-copy')
+        (extra / 'evidence').mkdir(); (extra / 'evidence' / 'log').write_text('ignored data')
+        self.config['live'] = ['worktree', 'clone', 'archive']
+        rows = self.clone_run()
+        self.assertEqual(rows['tool-copy'][0], 'would remove clone', rows)
+        self.assertTrue(rows['tool'][1].startswith('KEEP: only checkout of test/tool'), rows)
+        plan = Path(self.config['report_dir']) / 'one.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.assertEqual(self.approve(plan, 'all')[0], 0)
+        rows = self.clone_run(apply=True)
+        self.assertEqual(rows['tool-copy'][0], 'remove clone', rows)
+        self.assertFalse(extra.exists())
+        self.assertTrue(kept.exists())
+        [record] = store._read_index(Path(self.config['nas_root']))
+        self.assertEqual(record.source_path, str(extra))
+        listing = store._manifest_path(store._archive_path(Path(self.config['nas_root']), record)).read_text()
+        self.assertIn('tool-copy/evidence/log\n', listing)
+
+    def test_unapproved_redundant_clone_is_kept_even_when_live(self):
+        _, extra = self.clones('tool', 'tool-copy')
+        self.config['live'] = ['worktree', 'clone', 'archive']
+        rows = self.clone_run(apply=True)
+        self.assertEqual(rows['tool-copy'], ('skip', reclaim.APPROVAL_NEEDED), rows)
+        self.assertTrue(extra.exists())
+
+    def test_only_clone_of_a_repository_is_kept(self):
+        [only] = self.clones('tool')
+        self.config['live'] = ['worktree', 'clone', 'archive']
+        rows = self.clone_run()
+        self.assertEqual(rows['tool'], ('skip', 'KEEP: only checkout of test/tool on this host'), rows)
+        self.assertNotIn('id', self.entry.actions[0])
+        self.assertTrue(only.exists())
+
+    def test_clone_with_unpushed_branch_or_unique_reflog_is_kept(self):
+        _, branch, amended = self.clones('tool', 'tool-branch', 'tool-amended')
+        self.git(branch, 'commit', '--allow-empty', '-qm', 'side')
+        self.git(branch, 'branch', 'side'); self.git(branch, 'reset', '-q', '--hard', 'HEAD~1')
+        self.git(amended, 'commit', '--allow-empty', '-qm', 'lost'); self.git(amended, 'reset', '-q', '--hard', 'HEAD~1')
+        rows = self.clone_run()
+        self.assertEqual(rows['tool-branch'], ('skip', 'UNIQUE: local refs not on GitHub origin: refs/heads/side'), rows)
+        self.assertEqual(rows['tool-amended'], ('skip', 'UNIQUE: 1 reflog commits not on GitHub origin'), rows)
+        self.assertEqual(rows['tool'][0], 'would remove clone', rows)
+
+    def test_clone_whose_only_other_checkout_is_nested_inside_it_is_kept(self):
+        [tool] = self.clones('tool')
+        inner = tool / 'evidence' / 'inner'
+        inner.parent.mkdir()
+        self.git(inner.parent, 'clone', '-q', str(self.root / 'remote.git'), 'inner')
+        self.git(inner, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false',
+                 'commit', '--allow-empty', '-qm', 'side')
+        self.git(inner, 'branch', 'side'); self.git(inner, 'reset', '-q', '--hard', 'HEAD~1')
+        self.config['hosts']['test']['roots'].append(str(inner.parent))
+        rows = self.clone_run()
+        self.assertEqual(rows['tool'], ('skip', 'KEEP: only checkout of test/tool on this host'), rows)
+        self.assertEqual(rows['inner'][0], 'skip', rows)
+
+    def test_clone_with_a_fetched_ref_deleted_from_github_is_kept(self):
+        _, stale = self.clones('tool', 'tool-stale')
+        bare = self.root / 'remote.git'
+        self.git(stale, 'commit', '--allow-empty', '-qm', 'gone')
+        self.git(stale, 'push', '-q', str(bare), 'HEAD:refs/heads/gone')
+        self.git(stale, 'fetch', '-q', str(bare), '+refs/heads/gone:refs/remotes/origin/gone')
+        self.git(stale, 'reset', '-q', '--hard', 'HEAD~1')
+        self.git(stale, 'reflog', 'expire', '--expire=now', '--all')
+        self.git(bare, 'update-ref', '-d', 'refs/heads/gone')
+        rows = self.clone_run()
+        self.assertEqual(rows['tool-stale'], ('skip', 'UNIQUE: local refs not on GitHub origin: refs/remotes/origin/gone'), rows)
+
+    def test_clean_redundant_clone_is_copied_to_nas_before_removal(self):
+        _, extra = self.clones('tool', 'tool-copy')
+        (extra / '.git' / 'hooks' / 'pre-push').write_text('#!/bin/sh\n')
+        self.config['live'] = ['worktree', 'clone', 'archive']
+        self.clone_run()
+        plan = Path(self.config['report_dir']) / 'one.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.approve(plan, 'all')
+        rows = self.clone_run(apply=True)
+        self.assertEqual(rows['tool-copy'][0], 'remove clone', rows)
+        [record] = store._read_index(Path(self.config['nas_root']))
+        listing = store._manifest_path(store._archive_path(Path(self.config['nas_root']), record)).read_text()
+        self.assertIn('tool-copy/.git/hooks/pre-push\n', listing)
+
+    def test_approved_clone_is_kept_when_the_other_checkout_is_gone_before_removal(self):
+        kept, extra = self.clones('tool', 'tool-copy')
+        self.config['live'] = ['worktree', 'clone', 'archive']
+        self.clone_run()
+        plan = Path(self.config['report_dir']) / 'one.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.approve(plan, 'all')
+        approved = self.engine.check_approval
+        def approve_then_lose_the_other(*args):
+            approved(*args)
+            shutil.rmtree(kept)
+        with patch.object(self.engine, 'check_approval', side_effect=approve_then_lose_the_other):
+            rows = self.clone_run(apply=True)
+        self.assertEqual(rows['tool-copy'], ('skip', 'KEEP: only checkout of test/tool on this host'), rows)
+        self.assertTrue(extra.exists())
+
+    def test_tier_marked_for_approval_holds_unapproved_worktrees(self):
+        _, work = self.worktree()
+        self.config['approval'] = ['worktree']
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertTrue(work.exists(), self.entry.actions)
+        self.assertEqual(self.entry.actions[-1]['reason'], reclaim.APPROVAL_NEEDED)
+
+    def test_approved_worktree_is_removed(self):
+        _, work = self.worktree()
+        self.config['approval'] = ['worktree']
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        plan = Path(self.config['report_dir']) / 'one.plan.json'
+        plan.parent.mkdir(parents=True)
+        reclaim.write_plan(plan, [self.entry], None)
+        self.approve(plan, 'all')
+        self.entry = self.engine.report = report.HostReport('test')
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+        self.assertFalse(work.exists(), self.entry.actions)
+
+    def test_approved_items_on_windows_hosts_are_never_acted_on(self):
+        windows = reclaim.Reclaimer(hosts.Host('test', 'powershell', 'test'), self.config, True, self.protection, self.entry)
+        with reclaim.approvals(self.config['report_dir']) as found:
+            found['a' * 16] = dict(host='test', tier='archive', path=str(self.root / 'x'))
+        error = self.failure(lambda: windows.check_approval('a' * 16, 'archive', str(self.root / 'x')))
+        self.assertEqual((type(error), str(error)), (ValueError, reclaim.APPROVAL_WINDOWS))
+
+    def test_rules_without_approval_act_without_a_plan(self):
+        source = self.aged('automatic', 31)
+        self.config['hosts']['test']['archive'] = [str(source)]
+        rows = self.archive_now()
+        self.assertFalse(source.exists(), rows)
+
+    def test_approve_refuses_ids_not_in_the_plan_and_records_nothing(self):
+        source = self.aged('gated', 31)
+        plan, items = self.planned(source, approval=True)
+        code, output = self.approve(plan, items[0]['id'], 'f' * 16)
+        self.assertEqual(code, 2)
+        self.assertIn('f' * 16, output)
+        self.assertFalse((Path(self.config['report_dir']) / reclaim.APPROVALS).exists())
+        self.assertEqual(self.approve(plan, 'all', items[0]['id'])[0], 2)
+        partial = dict((key, items[0][key]) for key in ('id', 'host', 'tier', 'path'))
+        plan.write_text(json.dumps(dict(items=[partial])))
+        code, output = self.approve(plan, 'all')
+        self.assertEqual(code, 2)
+        self.assertIn('is not a reclaim dry-run plan', output)
+        self.assertFalse((Path(self.config['report_dir']) / reclaim.APPROVALS).exists())
+
+    def test_dry_run_writes_the_plan_next_to_the_report(self):
+        code, summary, _ = self.reclaim_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(summary['plan']), Path(summary['report']).with_suffix('.plan.json'))
+        self.assertEqual(json.loads(Path(summary['plan']).read_text())['items'], [])
+
+    def test_item_limit_stops_acting_and_skips_the_rest(self):
+        sources, rows = self.limited_archives([10, 10, 10], max_items_per_run=1)
+        self.assertEqual([source.exists() for source in sources], [False, True, True], rows)
+        self.assertEqual([action for action, _ in rows], ['archive and remove', 'skip', 'skip'])
+        self.assertEqual([reason for _, reason in rows[1:]], [reclaim.LIMIT_REACHED] * 2)
+
+    def test_run_deadline_finishes_the_item_in_flight_then_stops(self):
+        original = reclaim.preserve
+        def preserve_then_pass_deadline(*args, **kwargs):
+            saved = original(*args, **kwargs)
+            self.engine.deadline = time.monotonic() - 1
+            return saved
+        with patch.object(reclaim, 'preserve', side_effect=preserve_then_pass_deadline):
+            with self.assertRaisesRegex(reclaim.DeadlineReached, 'after 1 of 3 items'):
+                self.limited_archives([10, 10, 10])
+        self.assertEqual(len(list(self.root.glob('evidence-*'))), 2)
+        self.assertEqual([row['action'] for row in self.entry.actions], ['archive and remove'])
+
+    def probes_after_deadline(self, run):
+        operations = []
+        original = reclaim.probe
+        def recording(host, operation, *args, **kwargs):
+            operations.append(operation)
+            return original(host, operation, *args, **kwargs)
+        self.engine.deadline = time.monotonic() - 1
+        with patch.object(reclaim, 'probe', side_effect=recording), patch.object(protect, 'collect', return_value=self.protection):
+            with self.assertRaisesRegex(reclaim.DeadlineReached, 'while preparing.*0 items done'):
+                run()
+        return operations
+
+    def test_run_deadline_stops_archive_preparation_before_its_next_probe(self):
+        first, second = self.aged('first', 8), self.aged('second', 8)
+        self.config['hosts']['test']['archive'] = [dict(path=str(first), category='artifact'), dict(path=str(second), category='artifact')]
+        loaded = []
+        self.engine.load_activity = lambda: loaded.append(True)
+        self.assertEqual(self.probes_after_deadline(self.engine.archives), ['expand'])
+        self.assertEqual(loaded, [])
+        self.assertTrue(first.exists() and second.exists())
+
+    def test_run_deadline_stops_worktree_preparation_before_the_protection_check(self):
+        with patch.object(self.protection, 'batch') as batch:
+            self.assertEqual(self.probes_after_deadline(self.engine.worktrees), ['discover'])
+        batch.assert_not_called()
+
+    def test_run_deadline_stops_archive_prefetch_before_its_next_batch(self):
+        source = self.aged('evidence', 8)
+        self.config['hosts']['test']['archive'] = [str(source)]
+        def activity():
+            self.engine.activity = dict(blocked=False)
+            self.engine.deadline = time.monotonic() - 1
+        self.engine.load_activity = activity
+        self.engine.deadline = None
+        operations = []
+        original = reclaim.probe
+        def recording(host, operation, *args, **kwargs):
+            operations.append(operation)
+            return original(host, operation, *args, **kwargs)
+        with patch.object(reclaim, 'probe', side_effect=recording), patch.object(protect, 'collect', return_value=self.protection):
+            with self.assertRaisesRegex(reclaim.DeadlineReached, 'after 0 of 1 prefetch batches; 0 items done'):
+                self.engine.archives()
+        self.assertNotIn('batch', operations)
+        self.assertTrue(source.exists())
+
+    def test_run_deadline_stops_clone_preparation_before_its_next_probe(self):
+        self.clones('a', 'b')
+        self.assertNotIn('repo', self.probes_after_deadline(self.engine.clones))
+
+    def test_volume_limit_stops_before_crossing_the_byte_cap(self):
+        sources, rows = self.limited_archives([10, 500_000, 10], max_gib_per_run=100_000 / 1024**3)
+        self.assertEqual([source.exists() for source in sources], [False, True, True], rows)
+        self.assertEqual(rows[1:], [('skip', reclaim.LIMIT_REACHED)] * 2)
+
+    def test_item_that_fails_its_fresh_recheck_does_not_use_the_budget(self):
+        calls = []
+        def reason(path, **kw):
+            calls.append(path)
+            return 'IN USE: opened after preview' if path.endswith('evidence-0') and calls.count(path) > 1 else ''
+        self.protection.reason.side_effect = reason
+        sources, rows = self.limited_archives([10, 10], max_items_per_run=1)
+        self.assertEqual([source.exists() for source in sources], [True, False], rows)
+        self.assertEqual(rows, [('skip', 'IN USE: opened after preview'), rows[1]])
+        self.assertEqual(rows[1][0], 'archive and remove')
+
+    def test_host_local_refusal_uses_no_budget_and_no_nas_copy(self):
+        policy = self.root / '.config' / 'coldcleaner' / 'local.json'
+        policy.write_text(json.dumps(dict(archive=[str(self.root / 'evidence-1')])))
+        copies = []
+        original = reclaim.preserve
+        def counted(host, path, *args):
+            copies.append(path)
+            return original(host, path, *args)
+        with patch.object(reclaim, 'preserve', counted):
+            sources, rows = self.limited_archives([10, 10], max_items_per_run=1)
+        self.assertEqual([source.exists() for source in sources], [True, False], rows)
+        self.assertEqual(rows[0][0], 'skip')
+        self.assertIn('outside host-local policy', rows[0][1])
+        self.assertEqual(rows[1][0], 'archive and remove')
+        self.assertEqual(copies, [str(sources[1])])
+
+    def test_undecodable_installed_scan_is_a_sudo_skip(self):
+        installed = self.root / 'coldcleaner-proc-scan.py'
+        installed.write_bytes(b'\xff\xfe not utf-8')
+        with patch.object(reclaim_probe, 'SCAN_PATH', str(installed)), patch.object(
+                reclaim_probe.os, 'geteuid', return_value=1000), patch.object(reclaim_probe.subprocess, 'run') as run:
+            error = self.failure(self.read_references)
+        self.assertEqual((type(error), str(error)), (ValueError, reclaim_probe.NEEDS_SUDO))
+        run.assert_not_called()
+
+    def test_limit_is_checked_before_copying_to_the_nas(self):
+        copies = []
+        original = reclaim.preserve
+        def counted(host, path, *args):
+            copies.append(path)
+            return original(host, path, *args)
+        with patch.object(reclaim, 'preserve', counted):
+            sources, rows = self.limited_archives([10, 10], max_items_per_run=1)
+        self.assertEqual(copies, [str(sources[0])])
+        self.assertEqual(rows[1], ('skip', reclaim.LIMIT_REACHED))
 
     def test_unmounted_nas_is_an_error_and_keeps_source(self):
         source = self.root / 'evidence'; source.mkdir(); (source / 'unique').write_text('keep')
@@ -1500,6 +2381,45 @@ class ReclaimTests(unittest.TestCase):
                     reclaim_probe.guard(path)
         self.assertTrue(home.is_dir())
 
+    def test_guard_refuses_os_and_personal_locations(self):
+        home = self.root / 'home'
+        for name in ('Documents', 'Desktop', 'Pictures', 'Library/Caches', 'iCloud Drive', 'Google Drive', 'OneDrive - Work'):
+            (home / name / 'x').mkdir(parents=True)
+        with patch.dict(os.environ, HOME=str(home)), patch.object(reclaim_probe, 'threads', return_value=[]), \
+                patch.object(reclaim_probe, 'references', return_value=[]):
+            for path in ('/etc/ssh', '/usr/share', '/System/Library', '/mnt/shared-memory/Agent-Space', '/mnt',
+                         *(str(home / name / 'x') for name in ('Documents', 'Desktop', 'Pictures', 'Library/Caches',
+                                                                'iCloud Drive', 'Google Drive', 'OneDrive - Work'))):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'protected location'):
+                    reclaim_probe.guard(path)
+            (home / 'projects' / 'scratch').mkdir(parents=True)
+            reclaim_probe.guard(home / 'projects' / 'scratch')
+
+    def test_guard_refuses_case_aliases_of_protected_locations_on_macos(self):
+        home = self.root / 'home'
+        with patch.dict(os.environ, HOME=str(home)), patch.object(reclaim_probe.sys, 'platform', 'darwin'):
+            for path in ('/ETC/ssh', '/system/Library', str(home / 'documents' / 'x'), str(home / 'LIBRARY' / 'Caches')):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'protected location'):
+                    reclaim_probe.guard(path)
+
+    def test_guard_refuses_obsidian_vaults_and_folders_that_hold_one(self):
+        vault = self.root / 'outer' / 'vault'; (vault / '.obsidian').mkdir(parents=True)
+        (self.root / 'other' / 'vault' / '.Obsidian').mkdir(parents=True)
+        (vault / 'notes').mkdir(); (vault / 'notes' / 'a.md').write_text('keep')
+        with patch.object(reclaim_probe, 'threads', return_value=[]), patch.object(reclaim_probe, 'references', return_value=[]):
+            for path in (vault, vault / 'notes', self.root / 'outer', self.root / 'other'):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'protected location: Obsidian vault'):
+                    reclaim_probe.guard(path)
+        self.assertTrue((vault / 'notes' / 'a.md').exists())
+
+    def test_rules_protected_list_reaches_the_probe_guard(self):
+        source = self.root / 'evidence'; source.mkdir(); (source / 'data').write_text('keep')
+        self.config['hosts']['test']['protected'] = [str(source)]
+        rows = self.archive_rows(source)
+        self.assertEqual([row['action'] for row in rows], ['skip'], rows)
+        self.assertIn('protected location: ' + str(source), rows[0]['reason'])
+        self.assertTrue((source / 'data').exists())
+
     def test_guard_retains_process_thread_recent_symlink_and_keep_local(self):
         source = self.root / 'evidence'; source.mkdir(); (source / 'data').write_text('unique')
         alias = self.root / 'alias'; alias.symlink_to(source, target_is_directory=True)
@@ -1599,13 +2519,258 @@ class ReclaimTests(unittest.TestCase):
                                                     'OperationalError: no such column: cwd$'):
                 reclaim_probe.main(dict(operation='guard', path=str(self.root / 'old')))
 
+    def claude_session(self, name, cwds, age):
+        session = self.root / '.claude' / 'projects' / name
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_text(''.join(json.dumps(dict(type='user', cwd=cwd)) + '\n' for cwd in cwds))
+        os.utime(session, (time.time() - age,) * 2)
+
+    def test_claude_code_sessions_protect_recent_workspaces(self):
+        now = int(time.time())
+        recent, moved, idle, broad = (self.root / name for name in ('recent', 'moved', 'idle', 'broad'))
+        for folder in (recent, moved, idle, broad):
+            folder.mkdir(); (folder / 'data').write_text('x')
+            os.utime(folder / 'data', (now - 30 * 86400,) * 2); os.utime(folder, (now - 30 * 86400,) * 2)
+        self.claude_session('-recent/a.jsonl', [str(recent / 'sub')], 3600)
+        self.claude_session('-start/b/subagents/agent-1.jsonl', ['/elsewhere', str(moved), '/elsewhere'], 3600)
+        self.claude_session('-idle/c.jsonl', [str(idle)], 10 * 86400)
+        self.claude_session('-home/d.jsonl', [str(self.root)], 0)
+        (self.root / '.claude' / 'projects' / '-empty.jsonl').write_text('')
+        with patch.object(reclaim_probe, 'claude_threads', self.read_claude):
+            for folder, reference in ((recent, recent / 'sub'), (moved, moved)):
+                with self.subTest(folder=folder.name):
+                    with self.assertRaisesRegex(ValueError, '^Claude Code thread uses ' + re.escape(str(reference)) + '$'):
+                        reclaim_probe.main(dict(operation='guard', path=str(folder), days=7))
+            for folder in (idle, broad):
+                with self.subTest(folder=folder.name):
+                    self.assertEqual(reclaim_probe.main(dict(operation='guard', path=str(folder), days=7))['files'], 1)
+            activity = reclaim_probe.main(dict(operation='activity'))
+            self.assertIn(str(idle), [path for name, path, _ in activity['threads'] if name == 'Claude Code'])
+            with self.assertRaisesRegex(ValueError, '^Claude Code thread uses ' + re.escape(str(idle)) + '$'):
+                reclaim_probe.main(dict(operation='guard', path=str(idle), days=14, activity=activity))
+
+    def test_unreadable_claude_sessions_protect_every_candidate(self):
+        (self.root / 'old').mkdir()
+        with patch.object(reclaim_probe, 'claude_threads', self.read_claude):
+            self.assertEqual(reclaim_probe.main(dict(operation='activity'))['notes'], ['Claude Code not installed'])
+            (self.root / '.claude').mkdir(); (self.root / '.claude' / 'projects').write_text('not a folder')
+            with self.assertRaisesRegex(ValueError, '^IN USE: Claude Code state unreadable, protecting every candidate: '
+                                                    'NotADirectoryError: '):
+                reclaim_probe.main(dict(operation='guard', path=str(self.root / 'old')))
+            (self.root / '.claude' / 'projects').unlink()
+            self.claude_session('-x/a.jsonl', [str(self.root / 'old')], 0)
+            for link in (self.root / '.claude' / 'projects' / '-x' / 'linked', self.root / '.claude' / 'projects' / '-x' / 'b.jsonl'):
+                with self.subTest(link=link.name):
+                    link.symlink_to(self.root / 'missing')
+                    with self.assertRaisesRegex(ValueError, '^IN USE: Claude Code state unreadable, protecting every candidate: '
+                                                            'ValueError: symlink in Claude Code sessions: '):
+                        reclaim_probe.main(dict(operation='guard', path=str(self.root / 'old'), days=1))
+                    link.unlink()
+            session = self.root / '.claude' / 'projects' / '-x' / 'a.jsonl'
+            for text in (json.dumps(dict(cwd='relative/path')), '{"cwd": null}', '{"cwd":"' + str(self.root / 'old')):
+                with self.subTest(text=text):
+                    session.write_text('{"cwd":"/elsewhere"}\n' + text)
+                    with self.assertRaisesRegex(ValueError, '^IN USE: Claude Code state unreadable, protecting every candidate: '
+                                                            'ValueError: unexpected cwd'):
+                        reclaim_probe.main(dict(operation='guard', path=str(self.root / 'old'), days=1))
+
+    def test_unexpired_lease_protects_its_folder_parents_and_contents(self):
+        parent = self.root / 'claimed'; source = parent / 'evidence'; source.mkdir(parents=True)
+        (source / 'data').write_text('x')
+        future = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 3600))
+        past = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 60))
+        for holder in (parent, source, source / 'nested'):
+            with self.subTest(holder=holder.name):
+                holder.mkdir(exist_ok=True)
+                lease = holder / ('.coldcleaner-lease' if holder == source else '.COLDCLEANER-LEASE')
+                lease.write_text(future + '\n')
+                with self.assertRaisesRegex(ValueError, '^leased until ' + future + ': ' + re.escape(str(lease)) + '$'):
+                    reclaim_probe.guard(source)
+                for text in ('2026-11-12', 'tomorrow', future + ' extra', '', '2026-1-1T0:0:0Z', '2099-1-1T00:00:00Z'):
+                    lease.write_text(text)
+                    with self.assertRaisesRegex(ValueError, '^unreadable .coldcleaner-lease, protecting: '):
+                        reclaim_probe.guard(source)
+                lease.write_text(past)
+                self.assertGreaterEqual(reclaim_probe.guard(source)['files'], 1)
+                lease.unlink()
+
+    def artifact_marker(self, policy='temporary', expires_in=None, **retention):
+        created = time.time() - 86400
+        marker = dict(schema_version=1, retention=dict(owner='coldcontribute', policy=policy, **retention),
+                      provenance=dict(producer='coldcontribute 0dc52a571f09',
+                                      created_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(created))))
+        if expires_in is not None:
+            marker['retention']['expires'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + expires_in))
+        return json.dumps(marker)
+
+    def test_artifact_marker_holds_kept_owned_and_invalid_artifacts_until_they_expire(self):
+        parent = self.root / 'fix'; receipt = parent / 'owner' / 'repo' / '7'; receipt.mkdir(parents=True)
+        (receipt / 'fix.json').write_text('{}')
+        receipt_file = parent / 'owner' / 'repo' / 'note.txt'; receipt_file.write_text('x')
+        keep = self.artifact_marker('keep')
+        owned = self.artifact_marker(expires_in=3600, preserved_at='/evidence/7.tar.gz')
+        expired = self.artifact_marker(expires_in=-60, preserved_at='/evidence/7.tar.gz')
+        def broken(change):
+            marker = json.loads(keep); change(marker); return json.dumps(marker).encode()
+        invalid = [b'', b'not json', b'[]', self.artifact_marker('keep', expires_in=3600).encode(),
+                   self.artifact_marker(expires_in=None).encode(), self.artifact_marker(expires_in=-2 * 86400).encode(),
+                   self.artifact_marker('forever').encode(), self.artifact_marker(expires_in=-60, extra=1).encode(),
+                   broken(lambda m: m.update(schema_version=2)), broken(lambda m: m.update(schema_version=True)),
+                   broken(lambda m: m['retention'].update(owner='')),
+                   broken(lambda m: m['provenance'].update(created_at='2026-11-12')),
+                   broken(lambda m: m['provenance'].update(created_at='2026-02-30T00:00:00Z')),
+                   broken(lambda m: m['provenance'].update(repo=dict(name='owner/repo', commit='abc'))),
+                   broken(lambda m: m.pop('provenance'))]
+        for source, marker in ((receipt, receipt / '.cold-artifact.json'), (receipt, parent / '.COLD-ARTIFACT.json'),
+                               (receipt, receipt / 'sub' / '.cold-artifact.json'),
+                               (receipt, receipt / 'fix.json.cold-artifact.json'),
+                               (receipt_file, receipt_file.with_name('note.txt.cold-artifact.json'))):
+            with self.subTest(source=source.name, marker=str(marker.relative_to(self.root))):
+                marker.parent.mkdir(exist_ok=True)
+                marker.write_text(keep)
+                with self.assertRaisesRegex(ValueError, '^artifact marker says keep \\(owner coldcontribute\\): '
+                                                        + re.escape(str(marker)) + '$'):
+                    reclaim_probe.guard(source)
+                marker.write_text(owned)
+                with self.assertRaisesRegex(ValueError, '^artifact marker owned by coldcontribute until .*Z: '
+                                                        + re.escape(str(marker)) + '$'):
+                    reclaim_probe.guard(source)
+                for text in invalid:
+                    marker.write_bytes(text)
+                    with self.assertRaisesRegex(ValueError, '^invalid artifact marker, protecting: '):
+                        reclaim_probe.guard(source)
+                marker.unlink(); marker.mkdir()
+                with self.assertRaisesRegex(ValueError, '^invalid artifact marker, protecting: '):
+                    reclaim_probe.guard(source)
+                marker.rmdir()
+                marker.write_text(expired)
+                with patch.object(reclaim_probe, 'running_programs', return_value=set()):
+                    self.assertGreaterEqual(reclaim_probe.guard(source)['files'], 1)
+                marker.unlink()
+                self.assertGreaterEqual(reclaim_probe.guard(source)['files'], 1)
+
+    def test_expired_artifact_marker_holds_while_its_owner_is_running(self):
+        receipt = self.root / 'fix' / 'owner' / 'repo' / '7'; receipt.mkdir(parents=True)
+        (receipt / 'fix.json').write_text('{}')
+        marker = receipt / '.cold-artifact.json'
+        marker.write_text(self.artifact_marker(expires_in=-60))
+        real = subprocess.run
+        def processes(listing):
+            def run(command, *args, **kwargs):
+                if command[0] != 'ps':
+                    return real(command, *args, **kwargs)
+                if listing is None:
+                    raise subprocess.CalledProcessError(1, command)
+                width = None if '-ww' in command else 30
+                return subprocess.CompletedProcess(command, 0, '\n'.join(line[:width] for line in listing.split('\n')), '')
+            return patch.object(reclaim_probe.subprocess, 'run', run)
+        idle = '    1 /sbin/init\n  %d python3 -m coldcontribute\n 42 python3 %s/run.py\n' % (os.getpid(), receipt)
+        for command in ('/home/user/.local/bin/coldcontribute fix 7', 'ColdContribute --serve',
+                        '/usr/bin/python3 /opt/coldcontribute.py', 'python3 -m coldcontribute.fix',
+                        '/usr/local/bin/python3 /srv/products/release/current/coldcontribute.py'):
+            with self.subTest(command=command), processes(idle + ' 77 ' + command + '\n'), \
+                    self.assertRaisesRegex(ValueError, '^artifact marker owner coldcontribute is running: '
+                                                       + re.escape(str(marker)) + '$'):
+                reclaim_probe.guard(receipt)
+        with processes(None), self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: '):
+            reclaim_probe.guard(receipt)
+        with processes(idle + ' 77 coldcontributor\n'):
+            self.assertGreaterEqual(reclaim_probe.guard(receipt)['files'], 1)
+
+    def test_owner_check_protects_when_proc_hides_other_users(self):
+        row = '23 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw,%s\n'
+        sys_row = '22 1 0:20 / /sys rw shared:7 - sysfs sysfs rw,hidepid=2\n'
+        for options, hidden in (('', False), ('hidepid=0', False), ('hidepid=off', False), ('hidepid=1', True),
+                                ('hidepid=2', True), ('hidepid=invisible', True), ('hidepid=ptraceable', True),
+                                ('gid=4,hidepid=noaccess', True)):
+            with self.subTest(options=options):
+                self.assertIs(reclaim_probe.hides_processes(sys_row + row % options), hidden)
+        if os.name == 'nt' or sys.platform == 'darwin':
+            return
+        with patch.object(reclaim_probe.os, 'geteuid', return_value=1000), \
+                patch.object(reclaim_probe, 'hides_processes', return_value=True), \
+                self.assertRaisesRegex(ValueError, "^artifact marker owner check incomplete, protecting: "
+                                                   "/proc hides other users' processes$"):
+            reclaim_probe.running_programs()
+
+    def test_macos_owner_check_reads_every_process_through_sudo(self):
+        calls = []
+        def sudo(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, ' 7 /usr/bin/python3 /opt/coldcontribute.py\n', '')
+        with patch.object(reclaim_probe.sys, 'platform', 'darwin'), patch.object(reclaim_probe, 'sudo_run', sudo):
+            self.assertIn('coldcontribute', reclaim_probe.running_programs())
+        self.assertEqual(calls, [['ps', '-A', '-ww', '-o', 'pid=,args=']])
+        refused = lambda command, **kwargs: subprocess.CompletedProcess(command, 1, '', 'ps: not permitted')
+        with patch.object(reclaim_probe.sys, 'platform', 'darwin'), patch.object(reclaim_probe, 'sudo_run', refused), \
+                self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: ps: not permitted$'):
+            reclaim_probe.running_programs()
+
+    def test_windows_owner_check_protects_when_a_command_line_is_unreadable(self):
+        def inventory(*rows):
+            listing = json.dumps([dict(ProcessId=pid, Name=name, ExecutablePath=exe, CommandLine=line)
+                                  for pid, name, exe, line in rows])
+            return patch.object(reclaim_probe.subprocess, 'run',
+                                return_value=subprocess.CompletedProcess([], 0, listing, ''))
+        idle = [(0, 'System Idle Process', None, None), (4, 'System', None, None),
+                (9, 'vmmemWSL', None, None), (10, 'csrss.exe', None, None),
+                (11, 'python.exe', 'C:\\py\\python.exe', 'python.exe C:\\tools\\coldcontribute.py')]
+        protected = lambda pid: pid == 10
+        with patch.object(reclaim_probe.os, 'name', 'nt'), \
+                patch.object(reclaim_probe, 'windows_arguments', lambda line: line.split()), \
+                patch.object(reclaim_probe, 'protected_process', protected), \
+                patch.object(reclaim_probe, 'exited', lambda pid: pid == 12):
+            with inventory(*idle):
+                self.assertIn('coldcontribute', reclaim_probe.running_programs())
+            with inventory(*idle, (12, 'python.exe', 'C:\\py\\python.exe', None)):
+                self.assertIn('coldcontribute', reclaim_probe.running_programs())
+            for unreadable in ((13, 'python.exe', 'C:\\py\\python.exe', None), (14, 'svc.exe', None, None)):
+                with self.subTest(process=unreadable), inventory(*idle, unreadable), \
+                        self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: '
+                                                           'CommandLine unreadable for process ' + str(unreadable[0])):
+                    reclaim_probe.running_programs()
+
+    def test_remove_rechecks_outside_markers_after_verifying_the_copy(self):
+        receipt = self.root / 'fix' / 'owner' / 'repo' / '7'; receipt.mkdir(parents=True)
+        (receipt / 'fix.json').write_text('{}')
+        manifest = reclaim_probe.tree(receipt, True)['manifest']
+        for marker in (self.root / 'fix' / '.cold-artifact.json', receipt.parent / '7.cold-artifact.json'):
+            with self.subTest(marker=marker.name):
+                real = reclaim_probe.tree
+                def marked_during_verify(path, hashes=False):
+                    if hashes:
+                        marker.write_text(self.artifact_marker('keep'))
+                    return real(path, hashes)
+                with patch.object(reclaim_probe, 'tree', marked_during_verify):
+                    with self.assertRaisesRegex(ValueError, '^artifact marker says keep'):
+                        reclaim_probe.main(dict(operation='remove', path=str(receipt), manifest=manifest))
+                self.assertTrue((receipt / 'fix.json').exists())
+                marker.unlink()
+
+    def test_worktree_remove_rechecks_markers_inside_after_the_git_proof(self):
+        repo, work = self.worktree()
+        head = self.git(work, 'rev-parse', 'HEAD')
+        bare = str(self.root / 'remote.git')
+        listing = self.git(repo, 'ls-remote', bare)
+        marker = work / 'evidence' / '.cold-artifact.json'
+        real = reclaim_probe.repo
+        def marked_after_proof(*args, **kwargs):
+            state = real(*args, **kwargs)
+            marker.parent.mkdir(exist_ok=True); marker.write_text(self.artifact_marker('keep'))
+            return state
+        with patch.object(reclaim_probe, 'repo', marked_after_proof), \
+                self.assertRaisesRegex(ValueError, '^artifact marker says keep'):
+            reclaim_probe.main(dict(operation='remove', path=str(work), head=head, branch='done',
+                                    remote=bare, listing=listing))
+        self.assertTrue(marker.exists())
+
     def run_json(self, apply=False):
         stdout, stderr = io.StringIO(), io.StringIO()
         with patch.object(disk, 'measure', return_value=disk.Usage(100, 20, 20)), \
                 patch.object(protect, 'collect', return_value=protect.Protection(self.host, str(self.root), set(), [])), \
                 patch.object(reclaim.Reclaimer, 'worktrees'), patch.object(reclaim.Reclaimer, 'archives'), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = cli.run(self.config, [self.host], apply, reclaim_only=True, as_json=True)
+            code = cli.run(self.config, [self.host], apply, as_json=True)
         return code, stdout.getvalue(), stderr.getvalue()
 
     def check_drive(self, mounted=True, drive=2, archive=2, root=1, source=None, source_device=1, kind='ext4'):
@@ -1635,7 +2800,7 @@ class ReclaimTests(unittest.TestCase):
 
     def test_local_archive_on_the_filesystem_being_cleaned_is_refused(self):
         with self.assertRaisesRegex(RuntimeError, 'same filesystem as the data being removed'):
-            self.check_drive(source='/home/work', source_device=2)
+            self.check_drive(source='/srv/work', source_device=2)
 
     def test_local_archive_on_a_memory_backed_filesystem_is_refused(self):
         for kind in ('tmpfs', 'ramfs'):
@@ -1643,7 +2808,7 @@ class ReclaimTests(unittest.TestCase):
                 self.check_drive(kind=kind)
 
     def test_local_archive_on_a_separate_mounted_drive_is_accepted_without_a_network_mount(self):
-        self.check_drive(source='/home/work', source_device=1)
+        self.check_drive(source='/srv/work', source_device=1)
 
     def test_local_archive_setting_reaches_the_archive_check(self):
         source = self.root / 'evidence'; source.mkdir(); (source / 'unique').write_text('keep')
@@ -1660,6 +2825,73 @@ class ReclaimTests(unittest.TestCase):
 
         self.assertTrue(source.exists())
 
+    def test_category_totals_match_in_report_header_and_json(self):
+        self.worktree()
+        for name in ('scratch-a', 'bench-a', 'bench-b', 'transcripts'):
+            self.aged(name, 31)
+        evidence = self.root / 'evidence'
+        self.config['hosts']['test']['archive'] = [
+            str(evidence / 'scratch-*'),
+            dict(path=str(evidence / 'bench-*'), category='test-output'),
+            dict(path=str(evidence / 'transcripts'), category='artifact', preservation='summary')]
+        store = self.root / 'memory'; store.mkdir()
+        self.config['memory_store'] = str(store)
+        (store / (hashlib.sha256(f"test:{evidence / 'transcripts'}".encode()).hexdigest() + '.json')).write_text(
+            json.dumps(dict(schema_version=1, host='test', path=str(evidence / 'transcripts'), summary='note')))
+        self.config['live'] = ['archive']
+        self.engine.apply = True
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.worktrees()
+            self.engine.archives()
+        summary = json.loads(json.dumps(cli.summary([self.entry], True, None, 'code', 'ok', []), default=str))
+        sizes = {Path(row['path']).name: row['bytes'] for row in self.entry_rows(summary)}
+        expected = {
+            'worktree': dict(items=1, reclaimable_bytes=sizes['work'], acted_bytes=0),
+            'clone': dict(items=0, reclaimable_bytes=0, acted_bytes=0),
+            'scratch': dict(items=1, reclaimable_bytes=sizes['scratch-a'], acted_bytes=sizes['scratch-a']),
+            'test-output': dict(items=2, reclaimable_bytes=sizes['bench-a'] + sizes['bench-b'],
+                                acted_bytes=sizes['bench-a'] + sizes['bench-b']),
+            'artifact': dict(items=1, reclaimable_bytes=sizes['transcripts'], acted_bytes=sizes['transcripts'])}
+        self.assertEqual(summary['categories'], expected)
+        self.assertGreater(min(sizes.values()), 0, sizes)
+        header = report.render([self.entry], True, reclaim=True).split('\n## test', 1)[0]
+        for label, key in (('Completed worktrees', 'worktree'), ('Scratch and temp', 'scratch'),
+                           ('Test and benchmark outputs', 'test-output'), ('Archived agent artifacts', 'artifact')):
+            values = expected[key]
+            self.assertIn(f"| {label} | {values['items']} | {values['reclaimable_bytes']} | {values['acted_bytes']} |", header)
+
+    def test_tagged_pattern_sets_the_category_when_an_untagged_one_also_matches(self):
+        self.aged('bench-a', 31)
+        evidence = self.root / 'evidence'
+        self.config['hosts']['test']['archive'] = [
+            str(evidence / '*'), dict(path=str(evidence / 'bench-*'), category='test-output')]
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        self.assertEqual([row['category'] for row in self.entry.actions], ['test-output'], self.entry.actions)
+        self.assertEqual(report.categories([self.entry])['test-output']['items'], 1)
+        self.config['hosts']['test']['archive'][1]['days'] = 60
+        self.entry.actions.clear()
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        self.assertEqual([(row['action'], row['category']) for row in self.entry.actions], [('skip', 'test-output')])
+
+    def test_tagged_pattern_matching_only_a_child_leaves_the_parent_untagged(self):
+        outer = self.aged('outer', 31)
+        (outer / 'bench-x').mkdir()
+        stamp = time.time() - 31 * 86400
+        for path in (outer / 'bench-x', outer):
+            os.utime(path, (stamp, stamp))
+        evidence = self.root / 'evidence'
+        self.config['hosts']['test']['archive'] = [
+            str(evidence / '*'), dict(path=str(evidence / 'outer' / 'bench-*'), category='test-output')]
+        with patch.object(protect, 'collect', return_value=self.protection):
+            self.engine.archives()
+        categories = {Path(row['path']).name: row['category'] for row in self.entry.actions}
+        self.assertEqual(categories, {'outer': 'scratch', 'bench-x': 'test-output'}, self.entry.actions)
+
+    def entry_rows(self, summary):
+        return [row for host in summary['hosts'] for row in host['actions']]
+
     def test_json_summary_is_one_object_on_stdout_with_progress_on_stderr(self):
         code, out, err = self.run_json()
         summary = json.loads(out)
@@ -1668,6 +2900,7 @@ class ReclaimTests(unittest.TestCase):
         self.assertTrue(Path(summary['report']).is_file())
         self.assertEqual([host['name'] for host in summary['hosts']], [self.host.name])
         self.assertEqual(summary['hosts'][0]['disk_after_percent'], 20.0)
+        self.assertEqual(summary['categories']['worktree'], dict(items=0, reclaimable_bytes=0, acted_bytes=0))
         self.assertIn('inspect', err)
         self.assertNotIn('inspect', out)
 
@@ -1675,14 +2908,14 @@ class ReclaimTests(unittest.TestCase):
         with patch.object(disk, 'measure', side_effect=OSError('offline')):
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
-                code = cli.run(self.config, [self.host], reclaim_only=True, as_json=True)
+                code = cli.run(self.config, [self.host], as_json=True)
         self.assertEqual(code, 1)
         summary = json.loads(stdout.getvalue())
         self.assertEqual(summary['status'], 'incomplete')
         self.assertIn('offline', summary['hosts'][0]['errors'][0])
 
     def test_apply_without_a_live_reclaim_tier_is_refused_with_json_and_exit_two(self):
-        self.config['live'] = ['cache']
+        self.config['live'] = ['project']
         stdout = io.StringIO()
         with patch.object(rules, 'load', return_value=self.config), patch.object(cli, 'run') as run, \
                 contextlib.redirect_stdout(stdout):
@@ -1691,7 +2924,112 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual(code, 2)
         refused = json.loads(stdout.getvalue())
         self.assertEqual(refused['status'], 'refused')
-        self.assertIn('neither worktree nor archive is listed in live', refused['reason'])
+        self.assertIn('none of worktree, clone or archive is listed in live', refused['reason'])
+
+    def test_apply_with_only_the_clone_tier_live_is_not_refused(self):
+        self.config['live'] = ['clone']
+        stdout = io.StringIO()
+        with patch.object(rules, 'load', return_value=self.config), patch.object(cli, 'run', return_value=0), \
+                contextlib.redirect_stdout(stdout):
+            cli.main(['reclaim', '--apply', '--json'])
+        self.assertNotIn('listed in live', stdout.getvalue())
+
+    def test_apply_with_a_missing_nas_root_is_refused_with_exit_two(self):
+        self.config['nas_root'] = str(self.root / 'absent' / 'archive')
+        stdout = io.StringIO()
+        with patch.object(rules, 'load', return_value=self.config), patch.object(cli, 'run') as run, \
+                contextlib.redirect_stdout(stdout):
+            code = cli.main(['reclaim', '--apply', '--json'])
+        run.assert_not_called()
+        self.assertEqual(code, 2)
+        refused = json.loads(stdout.getvalue())
+        self.assertEqual(refused['status'], 'refused')
+        self.assertIn(self.config['nas_root'] + ' does not exist', refused['reason'])
+        self.assertIn('local_archive_mount', refused['reason'])
+
+    def reclaim_main(self, *argv, measure=None):
+        Path(self.config['nas_root']).mkdir(parents=True, exist_ok=True)
+        stdout = io.StringIO()
+        with patch.object(rules, 'load', return_value=self.config), \
+                patch.object(disk, 'measure', return_value=disk.Usage(100, 20, 20), side_effect=measure), \
+                patch.object(protect, 'collect', return_value=protect.Protection(self.host, str(self.root), set(), [])), \
+                patch.object(reclaim.Reclaimer, 'worktrees') as worktrees, patch.object(reclaim.Reclaimer, 'archives'), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(['reclaim', '--host', 'test', '--json', *argv])
+        return code, json.loads(stdout.getvalue().splitlines()[-1]), worktrees.called
+
+    def test_apply_is_refused_until_a_dry_run_report_with_the_same_rules_exists(self):
+        code, refused, ran = self.reclaim_main('--apply')
+        self.assertEqual((code, refused['status'], ran), (2, 'refused', False))
+        self.assertIn('no complete reclaim dry-run report', refused['reason'])
+        self.assertIn(' for test;', refused['reason'])
+        self.assertEqual(self.reclaim_main()[0], 0)
+        code, summary, ran = self.reclaim_main('--apply')
+        self.assertEqual((code, summary['mode'], ran), (0, 'apply', True))
+
+    def test_apply_is_refused_when_rules_changed_since_the_dry_run(self):
+        self.reclaim_main()
+        self.config['rules_sha256'] = 'f' * 64
+        code, refused, ran = self.reclaim_main('--apply')
+        self.assertEqual((code, ran), (2, False))
+        self.assertIn('f' * 64, refused['reason'])
+
+    def test_apply_needs_a_dry_run_not_an_apply_report_for_every_selected_host(self):
+        other = hosts.Host('other', 'posix')
+        self.config['hosts']['other'] = dict(roots=[], archive=[])
+        with patch.dict(hosts.HOSTS, {'other': other}):
+            self.reclaim_main()
+            self.config['reclaim_hosts'] = ['test', 'other']
+            stdout = io.StringIO()
+            with patch.object(rules, 'load', return_value=self.config), patch.object(cli, 'run') as run, \
+                    contextlib.redirect_stdout(stdout):
+                code = cli.main(['reclaim', '--apply', '--json'])
+        run.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertIn(' for other;', json.loads(stdout.getvalue())['reason'])
+        for path in Path(self.config['report_dir']).glob('*.md'):
+            path.write_text(path.read_text().replace('Mode: dry run', 'Mode: apply, limited to live tiers'))
+        self.assertEqual(self.reclaim_main('--apply')[0], 2)
+
+    def test_a_failed_or_legacy_dry_run_does_not_unlock_apply(self):
+        self.assertEqual(self.reclaim_main(measure=OSError('offline'))[0], 1)
+        report.write([report.HostReport('test')], self.config['report_dir'], rules_sha256=self.config.get('rules_sha256'))
+        self.assertEqual(len(list(Path(self.config['report_dir']).glob('*.md'))), 2)
+        for report_path in Path(self.config['report_dir']).glob('*.md'):
+            with self.subTest(report=report_path.name):
+                code, refused, ran = self.reclaim_main('--apply', '--i-reviewed', str(report_path))
+                self.assertEqual((code, ran), (2, False))
+        code, refused, ran = self.reclaim_main('--apply')
+        self.assertEqual((code, ran), (2, False))
+
+    def test_report_text_cannot_forge_the_dry_run_marker(self):
+        forged = '\u2028'.join(['x', report.PREVIEWED + 'other', 'Rules: sha256 ' + 'f' * 64, 'Mode: dry run.', ''])
+        failed = report.HostReport('test', errors=[forged], actions=[dict(tier='archive', action='skip', path=forged, bytes=0, reason=forged)])
+        path = report.write([failed], self.root / 'reports', rules_sha256='f' * 64, reclaim=True)
+        self.assertEqual(report.dry_run_hosts(path), set())
+        complete = report.HostReport('other', actions=[dict(tier='archive', action='skip', path=forged, bytes=0, reason=forged)])
+        path = report.write([failed, complete], self.root / 'reports', rules_sha256='f' * 64, reclaim=True)
+        self.assertEqual(report.dry_run_hosts(path, 'f' * 64), {'other'})
+        self.assertEqual(report.dry_run_hosts(path, 'e' * 64), set())
+
+    def test_i_reviewed_accepts_a_reviewed_dry_run_report_for_the_host(self):
+        self.reclaim_main()
+        reviewed = next(Path(self.config['report_dir']).glob('*.md'))
+        self.config['rules_sha256'] = 'f' * 64
+        code, summary, ran = self.reclaim_main('--apply', '--i-reviewed', str(reviewed))
+        self.assertEqual((code, summary['mode'], ran), (0, 'apply', True))
+        apply_report = Path(summary['report'])
+        other = hosts.Host('other', 'posix')
+        self.config['hosts']['other'] = dict(roots=[], archive=[])
+        with patch.dict(hosts.HOSTS, {'other': other}), patch.object(rules, 'load', return_value=self.config), \
+                patch.object(cli, 'run') as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['reclaim', '--host', 'other', '--apply', '--i-reviewed', str(reviewed)]), 2)
+        run.assert_not_called()
+        for bad in (apply_report, self.root / 'missing.md'):
+            with self.subTest(report=bad.name):
+                code, refused, ran = self.reclaim_main('--apply', '--i-reviewed', str(bad))
+                self.assertEqual((code, ran), (2, False))
+                self.assertIn(str(bad), refused['reason'])
 
     def test_report_write_failure_after_apply_is_incomplete_not_refused(self):
         stdout = io.StringIO()
@@ -1700,7 +3038,7 @@ class ReclaimTests(unittest.TestCase):
                     patch.object(protect, 'collect', return_value=protect.Protection(self.host, str(self.root), set(), [])), \
                     patch.object(reclaim.Reclaimer, 'worktrees'), patch.object(reclaim.Reclaimer, 'archives'), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
-                code = cli.run(self.config, [self.host], True, reclaim_only=True, as_json=True)
+                code = cli.run(self.config, [self.host], True, as_json=True)
         summary = json.loads(stdout.getvalue())
         self.assertEqual(code, 1)
         self.assertEqual((summary['status'], summary['report']), ('incomplete', None))
@@ -1710,7 +3048,7 @@ class ReclaimTests(unittest.TestCase):
         stdout = io.StringIO()
         with patch.object(report, 'write', side_effect=OSError('disk full')), \
                 contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
-            code = cli.run(self.config, [], True, reclaim_only=True, as_json=True)
+            code = cli.run(self.config, [], True, as_json=True)
         summary = json.loads(stdout.getvalue())
         self.assertEqual(code, 1)
         self.assertEqual((summary['status'], summary['report'], summary['hosts']), ('incomplete', None, []))
@@ -1734,11 +3072,10 @@ class ReclaimTests(unittest.TestCase):
         with patch.object(rules, 'load', return_value=self.config), patch.object(cli, 'run', return_value=0) as run:
             self.assertEqual(cli.main(['reclaim']), 0)
         self.assertEqual([host.name for host in run.call_args.args[1]], ['server-a', 'winhost'])
-        self.assertEqual(run.call_args.kwargs, dict(reclaim_only=True, as_json=False))
+        self.assertEqual(run.call_args.kwargs, dict(as_json=False))
         with patch.object(disk, 'measure', return_value=disk.Usage(100, 20, 20)), \
                 patch.object(protect, 'collect', return_value=protect.Protection(self.host, str(self.root), set(), [])), \
                 patch.object(reclaim.Reclaimer, 'worktrees') as worktrees, patch.object(reclaim.Reclaimer, 'archives') as archives, \
-                patch.object(cli.store, 'enforce_cap', side_effect=AssertionError('NAS expiry')), \
-                patch.object(cli.tiers.Cleaner, 'cache', side_effect=AssertionError('cache action')), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.run(self.config, [self.host], reclaim_only=True), 0)
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.run(self.config, [self.host]), 0)
         worktrees.assert_called_once(); archives.assert_called_once()

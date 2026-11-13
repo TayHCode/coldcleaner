@@ -432,40 +432,6 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob(".coldcleaner-restore.*")), [])
         self.assertEqual(self.rows()[0]["status"], "stored")
 
-    def test_enforce_cap_oldest_first_and_preserves_unindexed_files(self):
-        first = self.archive()
-        store.restore(first.id, self.nas)
-        second = self.archive()
-        untouched = self.nas / "unindexed.tar.zst"
-        untouched.write_bytes(b"keep me")
-        predicted = store.enforce_cap(self.nas, second.archive_bytes, apply=False)
-        self.assertEqual([item.id for item in predicted], [first.id])
-        self.assertTrue(Path(first.archive_path).exists())
-        expired = store.enforce_cap(self.nas, second.archive_bytes, apply=True)
-        self.assertEqual([item.id for item in expired], [first.id])
-        self.assertFalse(Path(first.archive_path).exists())
-        self.assertTrue(Path(second.archive_path).exists())
-        self.assertEqual([row["id"] for row in self.rows()], [first.id, second.id])
-        self.assertEqual([row["status"] for row in self.rows()], ["expired", "stored"])
-        self.assertEqual(untouched.read_bytes(), b"keep me")
-        with self.assertRaisesRegex(ValueError, "expired"):
-            store.restore(first.id, self.nas)
-
-    def test_cap_preview_does_not_write_to_empty_read_only_nas(self):
-        self.nas.mkdir(mode=0o555)
-        self.addCleanup(self.nas.chmod, 0o755)
-        self.assertEqual(store.enforce_cap(self.nas, 0), [])
-        self.assertEqual(list(self.nas.iterdir()), [])
-
-    def test_cap_preview_preserves_index_and_archives_without_creating_lock(self):
-        record = self.archive()
-        (self.nas / '.index.lock').unlink()
-        before = self.snapshot(self.nas)
-        predicted = store.enforce_cap(self.nas, 0)
-        self.assertEqual([item.id for item in predicted], [record.id])
-        self.assertEqual(predicted[0].status, 'expired')
-        self.assertEqual(self.snapshot(self.nas), before)
-
     def test_concurrent_archives_do_not_lose_index_rows(self):
         sources = [self.root / f"concurrent {index}" for index in range(8)]
         for index, source in enumerate(sources):
@@ -479,41 +445,6 @@ class StoreTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in self.rows()}, {record.id for record in records})
         self.assertTrue(all(Path(record.archive_path).exists() for record in records))
         self.assertTrue(all(not source.exists() for source in sources))
-
-    def test_expiry_is_recorded_before_interrupted_deletion(self):
-        record = self.archive()
-        unlink = Path.unlink
-
-        def interrupt(path, **kwargs):
-            if str(path) == record.archive_path:
-                raise OSError("interrupted deletion")
-            return unlink(path, **kwargs)
-
-        with patch.object(Path, "unlink", autospec=True, side_effect=interrupt):
-            with self.assertRaisesRegex(OSError, "interrupted deletion"):
-                store.enforce_cap(self.nas, 0, apply=True)
-        self.assertEqual(self.rows()[0]["status"], "expired")
-        self.assertTrue(Path(record.archive_path).exists())
-
-    def test_enforce_cap_retries_expired_files_even_when_under_cap(self):
-        record = self.archive()
-        with store._index_lock(self.nas):
-            store._write_index(self.nas, [replace(record, status="expired")])
-        self.assertEqual(store.enforce_cap(self.nas, record.archive_bytes), [])
-        self.assertTrue(Path(record.archive_path).exists())
-        self.assertEqual(store.enforce_cap(self.nas, record.archive_bytes, apply=True), [])
-        self.assertFalse(Path(record.archive_path).exists())
-        self.assertFalse(store._manifest_path(Path(record.archive_path)).exists())
-        self.assertEqual(self.rows()[0]["status"], "expired")
-
-    def test_expiry_index_failure_keeps_archive_and_manifest(self):
-        record = self.archive()
-        with patch.object(store, "_write_index", side_effect=OSError("disk full")):
-            with self.assertRaisesRegex(OSError, "disk full"):
-                store.enforce_cap(self.nas, 0, apply=True)
-        self.assertTrue(Path(record.archive_path).exists())
-        self.assertTrue(store._manifest_path(Path(record.archive_path)).exists())
-        self.assertEqual(self.rows()[0]["status"], "stored")
 
     def test_slug_collision_gets_numeric_suffix(self):
         first = self.archive()
@@ -536,6 +467,7 @@ class StoreTests(unittest.TestCase):
                 store.archive(self.host, path, nas_root=self.nas)
         self.assertFalse(self.nas.exists())
 
+
     def test_archive_path_cannot_escape_nas(self):
         record = self.archive()
         outside = self.root / "outside.tar.zst"
@@ -543,9 +475,8 @@ class StoreTests(unittest.TestCase):
         with store._index_lock(self.nas):
             store._write_index(self.nas, [replace(record, archive_path=str(outside))])
         with self.assertRaisesRegex(ValueError, "escapes"):
-            store.enforce_cap(self.nas, 0, apply=True)
+            store.restore(record.id, self.nas, to=str(self.root / "restored"))
         self.assertEqual(outside.read_bytes(), b"do not delete")
-
 
 if __name__ == "__main__":
     unittest.main()

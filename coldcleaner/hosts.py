@@ -31,6 +31,8 @@ def argv(host: Host, script: str) -> list[str]:
         encoded = base64.b64encode(gzip.compress(script.encode("utf-8", "surrogateescape"), mtime=0)).decode()
         launcher = f"import base64,gzip,os;os.execvp('bash',['bash','-c',gzip.decompress(base64.b64decode('{encoded}')).decode('utf-8','surrogateescape')])"
         return [*SSH, host.ssh, f'wsl.exe -e python3 -c "{launcher}"']
+    if host.ssh is None:
+        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "-"]
     return [*SSH, host.ssh, "powershell -NoProfile -NonInteractive -Command -"]
 
 
@@ -91,6 +93,8 @@ def python_argv(host):
             raise ValueError('explicit WSL bridge and distro required')
         return [*SSH, host.ssh, 'wsl.exe -d ' + host.distro + ' -u root -e python3 -c "' + code + '"']
     if host.kind == 'powershell':
+        if host.ssh is None:
+            return ['python.exe', '-c', code]
         return [*SSH, host.ssh, 'python.exe -c "' + code + '"']
     return argv(host, 'python3 -c ' + shlex.quote(code))
 

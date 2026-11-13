@@ -67,9 +67,8 @@ class DoctorCase(unittest.TestCase):
         top = lines.index(next(line for line in lines if line.startswith('[')))
         lines[top:top] = [f'nas_root = "{nas_root}"', f'report_dir = "{report_dir}"', 'reclaim_hosts = ["box", "nas-box"]']
         lines += ['[hosts.box]', 'kind = "posix"', 'ssh = "box.example.invalid"', 'roots = []', 'archive = []',
-                  'compact = []', 'cache = []',
                   '[hosts.nas-box]', 'kind = "posix"', 'ssh = "nas-box.example.invalid"', 'roots = []',
-                  'archive = []', 'compact = []', 'cache = []']
+                  'archive = []']
         path.write_text('\n'.join(lines) + '\n')
         return path
 

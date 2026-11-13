@@ -1,67 +1,31 @@
-hard_pct = 85
 alert_pct = 80
 worktree_idle_days = 7
 archive_idle_days = 4
-project_idle_days = 28
-nas_cap_gb = 500
 nas_root = "/srv/coldcleaner/archive"
 report_dir = "/srv/coldcleaner/reports"
-compact_weekday = "sun"
 live = ["worktree", "archive"]
 reclaim_hosts = ["server-a", "winhost"]
-regenerable_paths = ["node_modules", ".venv", "venv", "target", "dist", "build", "__pycache__", ".cache", ".next"]
 already_compressed_extensions = [".zip", ".gz", ".zst", ".7z", ".jpg", ".jpeg", ".png", ".mp4", ".mov", ".mp3", ".flac", ".gguf", ".safetensors"]
 
 [hosts.server-a]
 kind = "posix"
 roots = ["~/projects", "~/.t3/worktrees", "~/.codex/worktrees"]
 archive = ["~/projects/*/.scratch", "~/projects/*/local"]
-cache = [
-  { path = "~/.cache/uv", command = "uv cache clean --cache-dir {path}" },
-  { path = "~/.npm/_cacache" },
-  { path = "~/.cache/pip" },
-  { path = "~/.cache/ms-playwright" },
-  { path = "~/.cache/go-build" },
-  { path = "~/.cache/claude-cli-nodejs" },
-  { path = "~/.local/share/Trash" },
-  { path = "/tmp", days = 7, owner = "alice" },
-  { path = "/var/tmp", days = 7, owner = "alice" },
-]
 
 [hosts.machost]
 kind = "posix"
 ssh = "machost"
 roots = ["~/REPOS"]
 archive = ["~/REPOS/*/.scratch", "~/REPOS/*/local"]
-cache = [
-  { path = "~/.tart/cache" },
-  { path = "~/Library/Caches/*" },
-  { path = "~/.cache" },
-  { path = "~/.npm/_cacache" },
-  { path = "~/Library/pnpm/store", command = "pnpm --store-dir {path} store prune" },
-]
 
 [hosts.winhost-wsl]
 kind = "wsl"
 ssh = "winhost"
 roots = ["~/projects"]
 archive = ["~/projects/*/.scratch", "~/projects/*/local"]
-cache = [
-  { path = "~/.cache" },
-  { path = "~/.npm/_cacache" },
-]
 
 [hosts.winhost]
 kind = "powershell"
 ssh = "winhost"
 roots = ['%USERPROFILE%\REPOS']
 archive = ['%USERPROFILE%\REPOS\*\.scratch', '%USERPROFILE%\REPOS\*\local']
-compact = ['%LOCALAPPDATA%\wsl\*\ext4.vhdx', '%LOCALAPPDATA%\Packages\*\LocalState\ext4.vhdx']
-cache = [
-  { path = '%LOCALAPPDATA%\uv\cache' },
-  { path = '%LOCALAPPDATA%\npm-cache' },
-  { path = 'C:\actions-runners\*\_work\_temp', days = 2, runner = true },
-  { path = 'C:\actions-runners\*\_scratch', days = 2, runner = true },
-  { path = 'C:\actions-runners\*\_jobs', days = 2, runner = true },
-  { path = '%TEMP%', days = 7 },
-]

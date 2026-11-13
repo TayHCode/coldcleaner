@@ -43,6 +43,17 @@ class HostTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.kwargs['input'], b'Get-PSDrive C')
 
+    def test_powershell_host_without_ssh_runs_powershell_exe_locally(self):
+        local = hosts.Host('winlocal', 'powershell')
+        result = subprocess.CompletedProcess([], 0, stdout=b'inventory', stderr=b'')
+        with patch('subprocess.run', return_value=result) as run:
+            hosts.run(local, 'Get-PSDrive C')
+        self.assertEqual(run.call_args.args[0], ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', '-'])
+        self.assertEqual(run.call_args.kwargs['input'], b'Get-PSDrive C')
+        command = hosts.python_argv(local)
+        self.assertEqual(command[:2], ['python.exe', '-c'])
+        self.assertNotIn('ssh', command)
+
     def test_retired_wsl_stream_is_refused_but_native_posix_stream_remains_available(self):
         with patch('subprocess.Popen', return_value='native stream') as popen:
             with self.assertRaisesRegex(ValueError, 'Windows WSL execution is retired'):

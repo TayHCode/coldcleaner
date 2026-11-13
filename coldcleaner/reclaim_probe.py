@@ -1,12 +1,12 @@
 """Stdlib probe sent to a cleanup host; every operation uses an explicit path."""
 import hashlib
 from contextlib import closing
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -83,8 +83,13 @@ def git(path, *args, check=True):
     return result.stdout.strip() if check else result
 
 
+def real_key(path):
+    fold = str.casefold if sys.platform == 'darwin' else os.path.normcase
+    return fold(os.path.realpath(path))
+
+
 def overlap(a, b):
-    a, b = os.path.normcase(os.path.realpath(a)), os.path.normcase(os.path.realpath(b))
+    a, b = real_key(a), real_key(b)
     try:
         return os.path.commonpath((a, b)) in (a, b)
     except ValueError:
@@ -139,14 +144,54 @@ def codex_threads():
     return [(cwd, updated) for cwd, updated in rows if os.path.normcase(os.path.abspath(cwd)) not in broad]
 
 
+CLAUDE_KEY = re.compile(rb'"cwd"\s*:')
+CLAUDE_CWD = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def raise_error(error):
+    raise error
+
+
+def claude_threads(since=None):
+    root = Path.home() / '.claude' / 'projects'
+    if not os.path.lexists(root):
+        return None
+    latest = {}
+    for directory, folders, names in os.walk(root, onerror=raise_error):
+        for name in folders + names:
+            if os.path.islink(os.path.join(directory, name)):
+                raise ValueError('symlink in Claude Code sessions: ' + os.path.join(directory, name))
+        for name in names:
+            if not name.endswith('.jsonl'):
+                continue
+            session = Path(directory) / name
+            try:
+                updated = session.stat().st_mtime
+                if since is not None and updated <= since:
+                    continue
+                content = session.read_bytes()
+            except FileNotFoundError:
+                continue
+            found = CLAUDE_CWD.findall(content)
+            if len(found) != len(CLAUDE_KEY.findall(content)):
+                raise ValueError('unexpected cwd in ' + str(session))
+            for raw in set(found):
+                cwd = json.loads(b'"' + raw + b'"')
+                if not os.path.isabs(cwd):
+                    raise ValueError('unexpected cwd in ' + str(session))
+                latest[cwd] = max(latest.get(cwd, updated), updated)
+    broad = {os.path.normcase(str(Path.home())), os.path.normcase(os.path.abspath(os.sep))}
+    return [(cwd, updated) for cwd, updated in latest.items() if os.path.normcase(os.path.abspath(cwd)) not in broad]
+
+
 def t3_threads():
     found = threads()
     return None if found is None else [(path, None) for path in found]
 
 
-def workspaces():
+def workspaces(since=None):
     found, notes, blocked = [], [], []
-    for name, detect in (('T3', t3_threads), ('Codex', codex_threads)):
+    for name, detect in (('T3', t3_threads), ('Codex', codex_threads), ('Claude Code', lambda: claude_threads(since))):
         try:
             result = detect()
         except Exception as error:
@@ -387,7 +432,8 @@ def wsl_references():
 
 SCAN_PATH = '/usr/local/libexec/coldcleaner-proc-scan.py'
 NEEDS_SUDO = 'IN USE: process inventory needs passwordless sudo (see README#sudo)'
-SUDO_REFUSED = re.compile(r'^sudo: (a password is required|sorry, user .* is not allowed)', re.M)
+SUDO_REFUSED = re.compile(r"^sudo: (a password is required|sorry, user .* is not allowed"
+                          r"|interactive authentication is required|I'm sorry .*\. I'm afraid I can't do that)", re.M)
 
 
 def sudo_run(command, **kwargs):
@@ -407,7 +453,7 @@ def sudo_run(command, **kwargs):
 def installed_scan():
     try:
         return Path(SCAN_PATH).read_text() == PROC_SCAN
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -472,7 +518,12 @@ def references(proc='/proc'):
         if 'vmmemWSL' in machines:
             paths.extend(wsl_references())
         return paths + drivers()
-    scan = ['-I', SCAN_PATH] if installed_scan() else ['-c', PROC_SCAN]
+    if os.geteuid() == 0:
+        scan = ['-c', PROC_SCAN]
+    elif installed_scan():
+        scan = ['-I', SCAN_PATH]
+    else:
+        raise ValueError(NEEDS_SUDO)
     result = sudo_run(['python3', *scan, str(proc)], text=True)
     if result.returncode and result.stderr.strip() == '/proc not readable':
         raise ValueError('process inventory incomplete: /proc not readable')
@@ -536,130 +587,6 @@ def reject_package_caches(root):
             continue
 
 
-CACHE_TOOLS = {
-    'uv': dict(names=('uv',), clean=('cache', 'prune'), where=('cache', 'dir'), running=r'uvx?'),
-    'npm': dict(names=('npm',), clean=('cache', 'clean', '--force'), where=('config', 'get', 'cache'),
-                inside='_cacache', running=r'np[mx](-cli\.js)?'),
-    'pnpm': dict(names=('pnpm',), clean=('store', 'prune'), where=('store', 'path'), running=r'pnp[mx](\.c?js)?'),
-    'pip': dict(names=('pip', 'pip3'), clean=('cache', 'purge'), where=('cache', 'dir'),
-                running=r'pip(3(\.\d+)?)?', module='pip'),
-    'brew': dict(names=('brew',), clean=('cleanup', '-s'), where=('--cache',), running=r'brew(\.sh|\.rb)?',
-                 env=dict(HOMEBREW_NO_AUTOREMOVE='1'), preview=('cleanup', '-n', '-s')),
-}
-TOOL_DIRS = ('~/.local/bin', '/opt/homebrew/bin', '/usr/local/bin')
-TOOL_SECONDS = 60
-CLEAN_SECONDS = 600
-
-
-def processes():
-    try:
-        result = subprocess.run(['ps', 'axww', '-o', 'pid=,command='], capture_output=True, timeout=TOOL_SECONDS)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise RuntimeError('process list unavailable: ' + str(error)) from None
-    if result.returncode:
-        raise RuntimeError('process list unavailable: ' + os.fsdecode(result.stderr).strip())
-    commands = []
-    for line in os.fsdecode(result.stdout).splitlines():
-        pid, _, command = line.strip().partition(' ')
-        if not pid.isdigit():
-            raise RuntimeError('process list unreadable: ' + line)
-        if int(pid) != os.getpid():
-            commands.append(command)
-    return commands
-
-
-def tool_running(spec, command):
-    words = command.split()
-    return (any(re.fullmatch(spec['running'], word.rsplit('/', 1)[-1]) for word in words)
-            or 'module' in spec and any(pair == ('-m', spec['module']) for pair in zip(words, words[1:])))
-
-
-def locate(tool, spec):
-    search = os.pathsep.join([os.environ.get('PATH', os.defpath), *(os.path.expanduser(d) for d in TOOL_DIRS)])
-    for name in spec['names']:
-        found = shutil.which(name, path=search)
-        if found:
-            return found, dict(os.environ, PATH=search, **spec.get('env', {}))
-    raise ValueError(tool + ' is not installed')
-
-
-def display(argv):
-    return ' '.join((Path(argv[0]).name, *argv[1:]))
-
-
-def tool_output(argv, env, seconds):
-    try:
-        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=seconds)
-    except subprocess.TimeoutExpired:
-        raise ValueError(display(argv) + ' timed out') from None
-    except OSError as error:
-        raise ValueError(display(argv) + ' failed: ' + str(error)) from None
-    if result.returncode:
-        raise ValueError(display(argv) + ' failed: ' + (result.stderr.strip().splitlines() or ['exit %d' % result.returncode])[-1])
-    return result.stdout
-
-
-def tool_cache(tool, spec, executable, env):
-    lines = tool_output([executable, *spec['where']], env, TOOL_SECONDS).strip().splitlines()
-    if len(lines) != 1:
-        raise ValueError(tool + ' reported no single cache location')
-    path = Path(lines[0].strip()) / spec.get('inside', '')
-    home = Path.home()
-    if not path.is_absolute() or '..' in path.parts or path == home or not path.is_relative_to(home):
-        raise ValueError(tool + ' cache location is not inside the home folder: ' + str(path))
-    for parent in (path, *path.parents):
-        if parent.is_symlink() or (parent / '.keep-local').exists():
-            raise ValueError('.keep-local or symlink ancestor: ' + str(parent))
-    if not path.is_dir():
-        raise ValueError('no ' + tool + ' cache at ' + str(path))
-    return str(path)
-
-
-def bounded(tool, spec, executable, env, path):
-    if 'preview' not in spec:
-        return
-    for line in tool_output([executable, *spec['preview']], env, TOOL_SECONDS).splitlines():
-        if not line.strip() or line.startswith('==> This operation would free approximately '):
-            continue
-        match = re.fullmatch(r'Would remove: (/.+) \([^()]*\)', line)
-        if not match:
-            raise ValueError(display([executable, *spec['preview']]) + ' output not understood: ' + line)
-        target = Path(match[1])
-        if '..' in target.parts or not target.is_relative_to(path):
-            raise ValueError(display([executable, *spec['clean']]) + ' would also remove ' + str(target) + ', outside its cache')
-
-
-def cache_tool(tool, commands, deadline):
-    spec = CACHE_TOOLS[tool]
-    row = dict(tool=tool, command=' '.join((tool, *spec['clean'])), path='', bytes=0, complete=True, skip='')
-    try:
-        executable, env = locate(tool, spec)
-        row['command'] = display([executable, *spec['clean']])
-        if any(tool_running(spec, command) for command in commands):
-            raise ValueError('IN USE: ' + tool + ' is running')
-        row['path'] = tool_cache(tool, spec, executable, env)
-        bounded(tool, spec, executable, env, row['path'])
-        row.update(measure(row['path'], deadline))
-    except ValueError as error:
-        row['skip'] = str(error)
-    return row
-
-
-def clean_cache(tool, path, seconds):
-    row = cache_tool(tool, processes(), time.monotonic() + seconds)
-    if row['skip']:
-        raise ValueError(row['skip'])
-    if row['path'] != path:
-        raise ValueError(tool + ' cache location changed to ' + row['path'])
-    spec = CACHE_TOOLS[tool]
-    executable, env = locate(tool, spec)
-    try:
-        tool_output([executable, *spec['clean']], env, CLEAN_SECONDS)
-    except ValueError as error:
-        raise RuntimeError(str(error)) from None
-    return dict(before=row['bytes'], after=measure(path, time.monotonic() + seconds)['bytes'])
-
-
 OS_STAMP_XATTRS = frozenset(('com.apple.provenance', 'com.apple.quarantine'))
 
 
@@ -694,7 +621,7 @@ def allocation(info):
     return getattr(info, 'st_blocks', (info.st_size + 511) // 512) * 512
 
 
-def measure(path, deadline):
+def measure(path, deadline, skip=frozenset()):
     try:
         root = os.lstat(extended(path))
     except FileNotFoundError:
@@ -709,6 +636,8 @@ def measure(path, deadline):
                 for entry in entries:
                     if time.monotonic() > deadline:
                         return dict(bytes=total, complete=False)
+                    if skip and os.path.normcase(entry.path) in skip:
+                        continue
                     try:
                         info = os.lstat(entry.path) if entry.is_dir(follow_symlinks=False) else entry.stat(follow_symlinks=False)
                     except OSError:
@@ -724,6 +653,66 @@ def measure(path, deadline):
     return dict(bytes=total, complete=complete)
 
 
+def unlisted(roots, covered, skip, seconds):
+    import glob
+    deadline = time.monotonic() + seconds
+    key = lambda path: os.path.normcase(extended(os.path.abspath(path)))
+    excluded = {key(path) for path in skip}
+    for pattern in covered:
+        for path in glob.iglob(expanded(pattern)):
+            if time.monotonic() > deadline:
+                return dict(rows=[], complete=False)
+            excluded.add(key(path))
+    scanned = []
+    for pattern in roots:
+        for root in glob.iglob(expanded(pattern)):
+            if time.monotonic() > deadline:
+                return dict(rows=[], complete=False)
+            root = os.path.abspath(root)
+            covered_root = any(key(parent) in excluded for parent in [root, *map(str, Path(root).parents)])
+            if os.path.isdir(root) and not os.path.islink(root) and root not in scanned and not covered_root:
+                scanned.append(root)
+    excluded.update(key(path) for path in scanned)
+    candidates, complete = [], True
+    for root in scanned:
+        try:
+            device = os.lstat(extended(root)).st_dev
+            entries = os.scandir(extended(root))
+        except OSError:
+            complete = False
+            continue
+        with entries:
+            children = []
+            for entry in entries:
+                if time.monotonic() > deadline:
+                    return dict(rows=[], complete=False)
+                children.append(entry)
+        for entry in sorted(children, key=lambda entry: entry.name):
+            if time.monotonic() > deadline:
+                return dict(rows=[], complete=False)
+            try:
+                info = os.lstat(entry.path)
+            except OSError:
+                complete = False
+                continue
+            if (os.path.normcase(entry.path) not in excluded and stat.S_ISDIR(info.st_mode) and info.st_dev == device
+                    and not getattr(info, 'st_file_attributes', 0) & 1024):
+                candidates.append((entry.path, os.path.join(root, entry.name)))
+    sizes = {}
+    for _ in range(3):
+        pending = [item for item in candidates if item not in sizes or not sizes[item]['complete']]
+        for index, item in enumerate(pending):
+            now = time.monotonic()
+            if now > deadline:
+                break
+            size = measure(item[0], now + (deadline - now) / (len(pending) - index), excluded)
+            if item not in sizes or size['bytes'] >= sizes[item]['bytes']:
+                sizes[item] = size
+    complete = complete and len(sizes) == len(candidates) and all(size['complete'] for size in sizes.values())
+    rows = [dict(path=shown, **sizes[(path, shown)]) for path, shown in candidates if (path, shown) in sizes]
+    return dict(rows=sorted(rows, key=lambda row: -row['bytes']), complete=complete)
+
+
 def tree(path, hashes=False):
     present(path)
     path = Path(path)
@@ -731,6 +720,7 @@ def tree(path, hashes=False):
     path = Path(extended(path))
     reject_package_caches(path)
     result = {}; security = {}; allocated = logical = files = 0; newest = path.lstat().st_mtime
+    entries = []
     device = path.lstat().st_dev
     pending = [path]
     while pending:
@@ -751,9 +741,16 @@ def tree(path, hashes=False):
             windows_file_safety(item)
         if item.name == '.keep-local':
             raise ValueError('.keep-local: ' + str(item))
+        if item.name.casefold() == LEASE:
+            check_lease(item)
+        if item.name.casefold().endswith(MARKER):
+            check_marker(item)
+        if item.name.casefold() == '.obsidian':
+            raise ValueError('protected location: Obsidian vault ' + str(item.parent))
         newest = max(newest, info.st_mtime)
         allocated += allocation(info)
         relative = str(item.relative_to(path.parent)).replace(os.sep, '/')
+        entries.append((relative, stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns, info.st_ctime_ns))
         if hashes:
             security[relative] = (windows_security(item) if os.name == 'nt' else
                                   dict(mode=info.st_mode & 0o777, uid=info.st_uid,
@@ -771,7 +768,213 @@ def tree(path, hashes=False):
                     result[relative] = sha256_hex(stream)
         else:
             raise ValueError('special file: ' + str(item))
-    return dict(bytes=allocated, logical_bytes=logical, files=files, newest=newest, manifest=result, security=security)
+    digest = hashlib.sha256(json.dumps(sorted(entries)).encode()).hexdigest()
+    return dict(bytes=allocated, logical_bytes=logical, files=files, newest=newest, manifest=result, security=security, digest=digest)
+
+
+PERSONAL_FOLDERS = ('Documents', 'Desktop', 'Pictures', 'Library', 'iCloud Drive', 'iCloudDrive', 'Google Drive')
+
+
+def protected_location(path, extra=()):
+    home = Path.home()
+    locations = [str(home / name) for name in PERSONAL_FOLDERS]
+    locations += [os.path.expandvars(os.path.expanduser(item)) for item in extra]
+    if os.name == 'nt':
+        system = os.environ.get('SystemRoot', 'C:\\Windows')
+        if not contained(path, os.path.join(system, 'Temp')):
+            locations.append(system)
+        locations += [os.environ[name] for name in ('ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+                                                     'OneDrive', 'OneDriveConsumer', 'OneDriveCommercial') if os.environ.get(name)]
+        anchor = Path(os.path.abspath(path)).parts[1:2]
+        if anchor and anchor[0].casefold().startswith('program files'):
+            return anchor[0]
+    else:
+        locations += ['/etc', '/usr', '/System', '/mnt/shared-memory']
+    for location in locations:
+        if overlap(path, location):
+            return location
+    if contained(path, str(home)):
+        first = Path(os.path.abspath(path)).relative_to(os.path.abspath(home)).parts[:1]
+        if first and first[0].casefold().startswith('onedrive'):
+            return str(home / first[0])
+    return None
+
+
+LOCAL_POLICY = '~/.config/coldcleaner/local.json'
+
+
+def expanded(item):
+    return os.path.expandvars(os.path.expanduser(item))
+
+
+def local_policy():
+    path = expanded(LOCAL_POLICY)
+    try:
+        policy = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        raise ValueError('no host-local policy at ' + path) from None
+    except (OSError, ValueError) as error:
+        raise ValueError('host-local policy unreadable: ' + path + ': ' + str(error)) from None
+    if not isinstance(policy, dict) or not set(policy) <= {'roots', 'archive'} or not all(
+            isinstance(items, list) and all(isinstance(item, str) and os.path.isabs(expanded(item)) for item in items)
+            for items in policy.values()):
+        raise ValueError('host-local policy invalid: ' + path + ' needs absolute "roots" and "archive" lists')
+    return policy
+
+
+def locally_allowed(path, worktree):
+    import glob
+    policy = local_policy()
+    if worktree:
+        allowed = any(contained(path, root) for root in policy.get('roots', []))
+    else:
+        target = os.path.normcase(os.path.normpath(path))
+        allowed = any(target == os.path.normcase(os.path.normpath(found))
+                      for pattern in policy.get('archive', []) for found in glob.glob(expanded(pattern)))
+    if not allowed:
+        raise ValueError('outside host-local policy ' + expanded(LOCAL_POLICY) + ': ' + str(path))
+
+
+LEASE = '.coldcleaner-lease'
+APPROVAL_STALE = 'APPROVAL STALE: changed since it was planned; approve it again from a new dry-run plan'
+
+
+def check_lease(lease):
+    if not os.path.lexists(lease):
+        return
+    try:
+        text = Path(lease).read_text(encoding='utf-8').strip()
+        if not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', text, re.ASCII):
+            raise ValueError(text)
+        expiry = datetime.strptime(text, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp()
+    except (OSError, ValueError):
+        raise ValueError('unreadable .coldcleaner-lease, protecting: ' + str(lease)) from None
+    if expiry > time.time():
+        raise ValueError('leased until ' + text + ': ' + str(lease))
+
+
+
+def check_leases(folder, file_marker=''):
+    try:
+        names = os.listdir(folder)
+    except OSError as error:
+        raise ValueError('lease check incomplete, protecting: ' + str(error)) from None
+    for name in names:
+        if name.casefold() == LEASE:
+            check_lease(Path(folder) / name)
+        if name.casefold() in (MARKER, file_marker.casefold()):
+            check_marker(Path(folder) / name)
+
+
+MARKER = '.cold-artifact.json'
+UTC_TIME = re.compile(r'[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z')
+
+
+def marker_time(value):
+    if not isinstance(value, str) or not UTC_TIME.fullmatch(value):
+        raise ValueError(value)
+    return datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+
+
+def nonempty(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError(value)
+    return value
+
+
+def fields(value, required, allowed):
+    if not isinstance(value, dict) or not set(required) <= set(value) <= set(allowed):
+        raise ValueError(value)
+    return value
+
+
+def marker_retention(marker):
+    marker = fields(marker, ('schema_version', 'retention', 'provenance'), ('schema_version', 'retention', 'provenance'))
+    if type(marker['schema_version']) is not int or marker['schema_version'] != 1:
+        raise ValueError(marker['schema_version'])
+    retention = fields(marker['retention'], ('owner', 'policy'), ('owner', 'policy', 'expires', 'preserved_at'))
+    provenance = fields(marker['provenance'], ('producer', 'created_at'), ('producer', 'created_at', 'run_id', 'repo'))
+    for value in [retention['owner'], provenance['producer']] + [
+            item[key] for item, key in ((retention, 'preserved_at'), (provenance, 'run_id')) if key in item]:
+        nonempty(value)
+    created = marker_time(provenance['created_at'])
+    if 'repo' in provenance:
+        repo = fields(provenance['repo'], ('name', 'commit'), ('name', 'commit', 'snapshot_tree'))
+        if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', nonempty(repo['name'])) or \
+                not re.fullmatch(r'[0-9a-f]{40}', nonempty(repo['commit'])) or \
+                repo.get('snapshot_tree') is not None and not re.fullmatch(r'[0-9a-f]{64}', nonempty(repo['snapshot_tree'])):
+            raise ValueError(repo)
+    if retention['policy'] not in ('temporary', 'keep') or (retention['policy'] == 'temporary') != ('expires' in retention):
+        raise ValueError(retention)
+    if 'expires' in retention and marker_time(retention['expires']) <= created:
+        raise ValueError(retention['expires'])
+    return retention
+
+
+def check_marker(path):
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            raise ValueError(path)
+        retention = marker_retention(json.loads(Path(path).read_text(encoding='utf-8')))
+    except (OSError, ValueError, TypeError, KeyError):
+        raise ValueError('invalid artifact marker, protecting: ' + str(path)) from None
+    if retention['policy'] == 'keep':
+        raise ValueError('artifact marker says keep (owner ' + retention['owner'] + '): ' + str(path))
+    if marker_time(retention['expires']) > datetime.now(timezone.utc):
+        raise ValueError('artifact marker owned by ' + retention['owner'] + ' until ' + retention['expires'] + ': ' + str(path))
+    if retention['owner'].casefold() in running_programs():
+        raise ValueError('artifact marker owner ' + retention['owner'] + ' is running: ' + str(path))
+
+
+def running_programs():
+    try:
+        if os.name == 'nt':
+            script = "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
+            rows = json.loads(subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
+                                             capture_output=True, text=True, check=True).stdout)
+            commands = [(row['ProcessId'], [row.get('Name') or ''] + windows_arguments(row['CommandLine']))
+                        for row in (rows if isinstance(rows, list) else [rows]) if row['ProcessId'] not in (0, 4)
+                        and (row.get('CommandLine') or unreadable_command_line(row))]
+        else:
+            command = ['ps', '-A', '-ww', '-o', 'pid=,args=']
+            if sys.platform == 'darwin':
+                result = sudo_run(command, text=True)
+                if result.returncode:
+                    raise ValueError(result.stderr.strip())
+                listing = result.stdout
+            else:
+                if os.geteuid() and hides_processes(Path('/proc/self/mountinfo').read_text()):
+                    raise ValueError("/proc hides other users' processes")
+                listing = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+            commands = [(int(pid), args.split()) for pid, _, args in
+                        (line.strip().partition(' ') for line in listing.split('\n') if line.strip())]
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+        raise ValueError('artifact marker owner check incomplete, protecting: ' + str(error)) from None
+    return {re.split(r'[\\/]', token)[-1].split('.')[0].casefold()
+            for pid, tokens in commands if pid != os.getpid() for token in tokens}
+
+
+def hides_processes(mountinfo):
+    for row in mountinfo.split('\n'):
+        fields = row.split(' - ')
+        if len(fields) == 2 and row.split()[4] == '/proc' and fields[1].split()[0] == 'proc':
+            options = {key: value for key, _, value in (option.partition('=') for option in fields[1].split()[-1].split(','))}
+            return options.get('hidepid', '0') not in ('0', 'off')
+    return False
+
+
+def unreadable_command_line(row):
+    if not row.get('ExecutablePath') and (row.get('Name') in ('vmmemWSL', 'vmmemCmZygote')
+                                          or protected_process(row['ProcessId'])):
+        return False
+    if exited(row['ProcessId']):
+        return False
+    raise ValueError('CommandLine unreadable for process ' + str(row['ProcessId']))
+
+
+def excluded(path, patterns):
+    import glob
+    return any(overlap(path, found) for pattern in patterns for found in glob.glob(expanded(pattern)))
 
 
 def present(path):
@@ -779,16 +982,28 @@ def present(path):
         raise ValueError('no longer exists; removed by another program')
 
 
-def guard(path, days=0, activity=None):
+def check_holds_above(path):
+    for parent in path.parents:
+        check_leases(parent, path.name + MARKER if parent == path.parent else '')
+
+
+def guard(path, days=0, activity=None, protected=()):
     path = Path(path)
     if not path.is_absolute() or '..' in path.parts or path in (Path(path.anchor), Path.home()):
         raise ValueError('invalid cleanup root')
+    location = protected_location(path, protected)
+    if location:
+        raise ValueError('protected location: ' + location)
     present(path)
     for parent in (path, *path.parents):
         if parent.is_symlink() or getattr(parent.lstat(), 'st_file_attributes', 0) & 1024 or (parent / '.keep-local').exists():
             raise ValueError('.keep-local or symlink ancestor: ' + str(parent))
+        if (parent / '.obsidian').exists():
+            raise ValueError('protected location: Obsidian vault ' + str(parent))
+        if parent.is_dir():
+            check_leases(parent, path.name + MARKER if parent == path.parent else '')
     if activity is None:
-        activity = workspaces()
+        activity = workspaces(time.time() - days * 86400)
         if activity['blocked']:
             raise ValueError('; '.join(activity['blocked']))
         activity['references'] = references()
@@ -819,6 +1034,16 @@ def disposable_stub(path, message=''):
     if any(entry.is_symlink() or not entry.is_dir() for entry in marker.iterdir()):
         return False
     return not any(files for name in ('refs', 'logs', 'worktrees') for _, _, files in os.walk(marker / name))
+
+
+def object_format(commit):
+    return 'sha256' if len(commit) == 64 else 'sha1'
+
+
+def reflog_ref(commit):
+    if not re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', commit):
+        raise ValueError('invalid reflog commit: ' + commit)
+    return 'refs/coldcleaner/reflog/' + commit
 
 
 def repo(path, listing='', stub_ok=False):
@@ -862,21 +1087,25 @@ def repo(path, listing='', stub_ok=False):
     if main and head and git(path, 'cat-file', '-e', main + '^{commit}', check=False).returncode == 0:
         merged = git(path, 'merge-base', '--is-ancestor', head, main, check=False).returncode == 0
         published = published or merged
+    reflog = []
     if published and (Path(path) / '.git').is_file():
         history = set()
         for ref in ['HEAD', *(['refs/heads/' + branch] if branch else [])]:
             history.update(git(path, 'reflog', 'show', '--format=%H', ref).splitlines())
-        for commit in history - {head}:
+        for commit in sorted(history - {head}):
             containing = set(git(path, 'for-each-ref', '--format=%(objectname)', '--contains', commit).splitlines())
             if not containing & set(refs.values()):
-                raise ValueError('unique reflog history requires preservation: ' + commit)
+                reflog.append(commit)
     linked = [line[9:] for line in git(path, 'worktree', 'list', '--porcelain').splitlines()
               if line.startswith('worktree ') and os.path.isdir(line[9:])
               and os.path.realpath(line[9:]) != os.path.realpath(path)]
+    worktree = (Path(path) / '.git').is_file()
+    linked_worktree = worktree and Path(git(path, 'rev-parse', '--path-format=absolute', '--git-dir')).resolve() != common.resolve()
+    stashes = not linked_worktree and bool(git(path, 'stash', 'list'))
     return dict(path=str(path), head=head, branch=branch, dirty=dirty, ignored=ignored,
-                stashes=bool(git(path, 'stash', 'list')), published=published, merged=merged,
+                stashes=stashes, published=published, merged=merged, reflog=reflog,
                 linked_worktrees=linked,
-                worktree=(Path(path) / '.git').is_file(), common=str(common),
+                worktree=worktree, common=str(common),
                 remote=git(path, 'remote', 'get-url', 'origin', check=False).stdout.strip())
 
 
@@ -888,13 +1117,13 @@ def own_config_fails(path):
 
 
 def discover(roots):
-    found = set()
+    found = {}
     errors, notes = [], []
-    for root in roots:
-        root = os.path.expandvars(os.path.expanduser(root))
+    for configured in roots:
+        root = os.path.expandvars(os.path.expanduser(configured))
         if not os.path.isdir(root):
             continue
-        for base, dirs, files in os.walk(root, onerror=lambda e: notes.append('Unreadable, skipped: ' + str(e))
+        for base, dirs, files in os.walk(root, onerror=lambda e: notes.append('Unreadable, skipped: ' + str(e.filename) + ': ' + str(e.strerror))
                                          if isinstance(e, PermissionError) else errors.append(str(e))):
             if '.git' in dirs or '.git' in files:
                 try:
@@ -908,14 +1137,47 @@ def discover(roots):
                         errors.append(base + ': ' + str(exc))
                     dirs[:] = [d for d in dirs if d != '.git']
                     continue
-                found.add(os.path.normpath(base))
-                found.update(os.path.normpath(line[9:]) for line in result.splitlines() if line.startswith('worktree ')
-                             and any(contained(line[9:], r) for r in roots))
+                found.setdefault(os.path.normpath(base), configured)
+                for line in result.splitlines():
+                    owner = next((r for r in roots if contained(line[9:], r)), None) if line.startswith('worktree ') else None
+                    if owner is not None:
+                        found.setdefault(os.path.normpath(line[9:]), owner)
                 dirs[:] = []
             else:
                 dirs[:] = [d for d in dirs if d not in ('node_modules', '.venv', 'venv', '.git', '__pycache__')
                            and not os.path.islink(os.path.join(base, d))]
-    return dict(paths=sorted(p for p in found if (Path(p) / '.git').is_file()), errors=errors, notes=notes)
+    paths = sorted(p for p in found if (Path(p) / '.git').is_file())
+    clones = sorted(p for p in found if (Path(p) / '.git').is_dir())
+    return dict(paths=paths, clones=clones, roots=found, errors=errors, notes=notes)
+
+
+def unpublished(path, commits, published):
+    if not commits:
+        return set()
+    known = published & set(git(path, 'for-each-ref', '--format=%(objectname)').splitlines())
+    result = git(path, 'rev-list', *commits, '--not', *known, '--', check=False)
+    if result.returncode:
+        return set(commits)
+    return set(result.stdout.split()) & set(commits)
+
+
+def clone_proof(path, listing):
+    published = set(line.split()[0] for line in listing.splitlines() if len(line.split()) == 2)
+    commits, unique = {}, []
+    for line in git(path, 'for-each-ref', '--format=%(objectname) %(objecttype) %(refname)').splitlines():
+        sha, kind, ref = line.split(' ', 2)
+        if ref == 'refs/stash' or sha in published:
+            continue
+        if kind == 'commit':
+            commits.setdefault(sha, []).append(ref)
+        else:
+            unique.append(ref)
+    missing = unpublished(path, list(commits), published)
+    unique += sorted(ref for sha in missing for ref in commits[sha])
+    history = set()
+    for ref in ['HEAD', *git(path, 'for-each-ref', '--format=%(refname)', 'refs/heads/').splitlines()]:
+        history.update(git(path, 'reflog', 'show', '--format=%H', ref, '--').split())
+    return dict(unique_refs=unique, reflog=sorted(unpublished(path, sorted(history), published)))
 
 
 def main(request):
@@ -941,9 +1203,21 @@ def main(request):
         return discover(request['roots'])
     if op == 'expand':
         import glob
-        return sorted(set(p for pattern in request['patterns'] for p in glob.glob(os.path.expandvars(os.path.expanduser(pattern)))))
+        found = {}
+        for pattern in request['patterns']:
+            for p in glob.glob(expanded(pattern)):
+                found.setdefault(p, []).append(pattern)
+        keys = {p: real_key(p) for p in found}
+        nested = lambda a, b: a == b or a.startswith(b.rstrip(os.sep) + os.sep) or b.startswith(a.rstrip(os.sep) + os.sep)
+        related = {p: list(dict.fromkeys(found[p] + [pattern for q in found if nested(keys[p], keys[q])
+                                                     for pattern in found[q]])) for p in found}
+        exclude = request.get('exclude', {})
+        return {p: patterns for p, patterns in sorted(related.items())
+                if not excluded(p, [item for pattern in patterns for item in exclude.get(pattern, [])])}
     if op == 'repo':
         return repo(path, request.get('listing', ''), request.get('stub_ok', False))
+    if op == 'clone':
+        return clone_proof(path, request['listing'])
     if op == 'context':
         parent = path if Path(path).is_dir() else str(Path(path).parent)
         result = git(parent, 'rev-parse', '--show-toplevel', check=False)
@@ -957,17 +1231,15 @@ def main(request):
                     found.append(path + base[len(root):])
                 dirs[:] = [name for name in dirs if name != '.git']
         return found
-    if op == 'cache-tools':
-        commands = processes()
-        deadline = time.monotonic() + request['seconds']
-        return [cache_tool(tool, commands, deadline) for tool in request['tools']]
-    if op == 'cache-clean':
-        return clean_cache(request['tool'], path, request['seconds'])
+    if op == 'unlisted':
+        return unlisted(request['roots'], request['covered'], request['skip'], request['seconds'])
     if op == 'sizes':
         deadline = time.monotonic() + request['seconds']
         return [measure(item, deadline) for item in request['paths']]
+    if op == 'allowed':
+        return locally_allowed(path, request['worktree'])
     if op == 'guard':
-        return guard(path, request.get('days', 0), request.get('activity'))
+        return guard(path, request.get('days', 0), request.get('activity'), request.get('protected', ()))
     if op == 'activity':
         return dict(**workspaces(), references=references())
     if op == 'manifest':
@@ -977,7 +1249,14 @@ def main(request):
         import tempfile
         with tempfile.TemporaryDirectory(prefix='coldcleaner-head-') as directory:
             bundle = Path(directory) / 'head.bundle'
-            git(path, 'bundle', 'create', str(bundle), 'HEAD')
+            source = Path(directory) / 'source.git'
+            git(directory, 'init', '-q', '--bare', '--object-format=' + git(path, 'rev-parse', '--show-object-format'), str(source))
+            common = git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+            (source / 'objects/info/alternates').write_text(str(Path(common) / 'objects') + '\n')
+            git(source, 'update-ref', '--no-deref', 'HEAD', git(path, 'rev-parse', '--verify', 'HEAD^{commit}'))
+            for commit in request.get('reflog', []):
+                git(source, 'update-ref', reflog_ref(commit), commit + '^{commit}')
+            git(source, 'bundle', 'create', str(bundle), 'HEAD', *map(reflog_ref, request.get('reflog', [])))
             with bundle.open('rb') as stream:
                 print(json.dumps(dict(sha256=sha256_hex(stream))), flush=True)
             with bundle.open('rb') as stream:
@@ -998,10 +1277,12 @@ def main(request):
                 if sha256_hex(stream) != request['sha256']:
                     raise ValueError('Git recovery bundle SHA-256 mismatch')
             pointer.unlink()
-            git(path, 'init')
+            git(path, 'init', '--object-format=' + object_format(request['head']))
             git(path, 'fetch', str(bundle), 'HEAD')
             if git(path, 'rev-parse', 'FETCH_HEAD') != request['head']:
                 raise ValueError('Git recovery head differs')
+            if request.get('reflog'):
+                git(path, 'fetch', str(bundle), *(f'{reflog_ref(c)}:{reflog_ref(c)}' for c in request['reflog']))
             if request['branch']:
                 git(path, 'symbolic-ref', 'HEAD', 'refs/heads/' + request['branch'])
             git(path, 'update-ref', '--no-deref', 'HEAD', request['head']) if not request['branch'] else git(path, 'update-ref', 'HEAD', request['head'])
@@ -1031,6 +1312,8 @@ def main(request):
         return dict(restored=str(target))
     if op == 'restore-cleanup':
         import shutil
+        if not Path(path).name.startswith('.coldcleaner-restore-'):
+            raise ValueError('not a restore staging folder: ' + path)
         shutil.rmtree(path)
         return None
     if op == 'restore':
@@ -1099,7 +1382,12 @@ def main(request):
             os.rename(source, target)
         return dict(restored=str(target))
     if op == 'remove':
-        guard(path, request.get('days', 0))
+        locally_allowed(path, bool(request.get('head')) or request.get('clone', False))
+        current = guard(path, request.get('days', 0), protected=request.get('protected', ()))
+        if request.get('digest') is not None and current['digest'] != request['digest']:
+            raise ValueError(APPROVAL_STALE)
+        if excluded(path, request.get('exclude', ())):
+            raise ValueError('excluded by rules')
         def verify(source):
             if request.get('manifest') is None and request.get('security') is None:
                 return
@@ -1115,16 +1403,23 @@ def main(request):
                          or keep.get('mount') and not os.path.ismount(keep['mount'])):
                 raise ValueError('verified archive is no longer present')
         branch_removed = False
+        recovery = {}
         if request.get('head'):
             state = repo(path, request['listing'])
-            if (state['head'] != request['head'] or state['dirty'] or state['stashes'] or not state['published']
-                    or state['ignored'] and request.get('manifest') is None):
+            if (state['head'] != request['head'] or state['branch'] != request['branch']
+                    or state['remote'] != request['remote'] or state['dirty'] or state['stashes'] or not state['published']
+                    or state['ignored'] and request.get('manifest') is None
+                    or state['reflog'] and (request.get('manifest') is None
+                                            or not set(state['reflog']) <= set(request.get('reflog') or ()))):
                 raise ValueError('Git proof changed before removal')
+            recovery = {key: state[key] for key in ('head', 'branch', 'remote', 'merged')}
             branch = state['branch']
             verify(Path(path))
             branches = git(path, 'worktree', 'list', '--porcelain').splitlines()
             keep_branch = branches.count('branch refs/heads/' + branch) > 1
             archived()
+            tree(Path(path))
+            check_holds_above(Path(path))
             git(state['common'], 'worktree', 'remove', '--', path)
             if branch and not keep_branch:
                 subprocess.run(['git', '--git-dir', state['common'], 'update-ref', '-d',
@@ -1139,9 +1434,10 @@ def main(request):
             try:
                 verify(quarantine)
                 archived()
+                check_holds_above(source)
             except Exception:
                 os.rename(quarantine, source)
                 raise
             delete(quarantine)
-        return dict(removed=path, branch_removed=branch_removed)
+        return dict(removed=path, branch_removed=branch_removed, **recovery)
     raise ValueError('unknown operation')
