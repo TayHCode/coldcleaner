@@ -331,6 +331,39 @@ class ReclaimTests(unittest.TestCase):
         found, = self.sizes([target])
         self.assertFalse(found['complete'])
 
+    def stale_main_proof(self, status):
+        repo, work = self.worktree()
+        self.git(work, 'remote', 'set-url', 'origin', 'https://github.com/me/repo.git')
+        head = self.git(work, 'rev-parse', 'HEAD'); github_main = 'f' * 40
+        calls = []
+        def run(host, script, **kwargs):
+            calls.append(script)
+            if script.startswith('git ls-remote --get-url'):
+                return Mock(stdout=b'https://github.com/me/repo.git\n')
+            if 'git ls-remote' in script:
+                return Mock(stdout=f'{github_main}\trefs/heads/main\n{head}\trefs/heads/done\n'.encode())
+            if 'graphql' in script:
+                return Mock(stdout=json.dumps({'data': {'repository': {'parent': None, 'pullRequests': {
+                    'nodes': [], 'pageInfo': {'hasNextPage': False}}}}}).encode())
+            if f'repos/me/repo/compare/{github_main}...{head}' in script:
+                return Mock(stdout=status.encode() + b'\n')
+            raise AssertionError(script)
+        with patch.object(hosts, 'run', side_effect=run):
+            state, prs, _ = reclaim.Reclaimer.proof(self.engine, str(work))
+        self.assertTrue(any('/compare/' in script for script in calls), calls)
+        self.assertTrue(state['published'])
+        return state, prs
+
+    def test_worktree_merged_on_github_but_not_fetched_locally_is_complete(self):
+        state, prs = self.stale_main_proof('behind')
+        self.assertTrue(state['merged'])
+        self.assertEqual(reclaim.completion(state, prs), '')
+
+    def test_worktree_diverged_from_github_main_stays_held(self):
+        state, prs = self.stale_main_proof('diverged')
+        self.assertFalse(state['merged'])
+        self.assertEqual(reclaim.completion(state, prs), 'IN USE: work is neither merged nor closed at this head')
+
     def test_worktree_whose_github_repository_is_gone_is_skipped(self):
         repo, work = self.worktree()
         self.git(work, 'remote', 'set-url', 'origin', 'https://github.com/me/gone.git')
@@ -2574,6 +2607,44 @@ class ReclaimTests(unittest.TestCase):
                                                             'ValueError: unexpected cwd'):
                         reclaim_probe.main(dict(operation='guard', path=str(self.root / 'old'), days=1))
 
+    def test_claude_session_with_a_tool_schema_cwd_still_protects_its_workspace(self):
+        recent, escaped = self.root / 'recent', self.root / 'escaped'
+        self.claude_session('-recent/a.jsonl', [str(recent)], 3600)
+        with (self.root / '.claude' / 'projects' / '-recent' / 'a.jsonl').open('a') as session:
+            session.write(json.dumps(dict(tools=[dict(input_schema=dict(properties=dict(
+                cwd=dict(type='string', description='"cwd": an absolute path'))))])) + '\n')
+            session.write('{"c\\u0077d": ' + json.dumps(str(escaped)) + '}\n')
+        with patch.object(reclaim_probe, 'claude_threads', self.read_claude):
+            found = reclaim_probe.workspaces()
+        self.assertEqual(found['blocked'], [])
+        self.assertEqual(sorted(path for name, path, _ in found['threads'] if name == 'Claude Code'),
+                         sorted([str(recent), str(escaped)]))
+
+    def test_unreadable_claude_session_cwd_lines_protect_every_candidate(self):
+        old = str(self.root / 'old')
+        self.claude_session('-x/a.jsonl', [], 0)
+        session = self.root / '.claude' / 'projects' / '-x' / 'a.jsonl'
+        unreadable = (json.dumps(dict(cwd='relative/path')), '{"cwd": null}', '{"cwd": ["/x"]}', '{"cwd": 1}',
+                      '{"cwd":"' + old, json.dumps(dict(cwd=dict(path=old))), '{"cwd":{',
+                      '{"c\\u0077d": null}', '{"c\\u0077d":"' + old,
+                      json.dumps(dict(message=dict(input=dict(cwd='relative/path')))),
+                      json.dumps(dict(message=dict(input=dict(cwd=None)))),
+                      json.dumps(dict(message=dict(input=dict(cwd=dict(path=old))))),
+                      json.dumps(dict(message=dict(input=dict(cwd={old: True})))),
+                      json.dumps(dict(message=dict(input=dict(cwd=[old])))),
+                      json.dumps(dict(properties=dict(cwd=None))),
+                      json.dumps(dict(message=dict(input=dict(properties=dict(cwd={old: True}))))),
+                      json.dumps(dict(input_schema=dict(cwd=dict(type='string')))),
+                      '{"cwd":"' + old + '","cwd":"/elsewhere"}',
+                      '{"message":{"cwd":"' + old + '"},"message":{}}')
+        with patch.object(reclaim_probe, 'claude_threads', self.read_claude):
+            for text in unreadable + tuple(text + '\n' for text in unreadable):
+                with self.subTest(text=text):
+                    session.write_text('{"cwd":"/elsewhere"}\n' + text)
+                    self.assertEqual(reclaim_probe.workspaces()['blocked'],
+                                     ['IN USE: Claude Code state unreadable, protecting every candidate: '
+                                      'ValueError: unexpected cwd in ' + str(session)])
+
     def test_unexpired_lease_protects_its_folder_parents_and_contents(self):
         parent = self.root / 'claimed'; source = parent / 'evidence'; source.mkdir(parents=True)
         (source / 'data').write_text('x')
@@ -2719,6 +2790,8 @@ class ReclaimTests(unittest.TestCase):
         with patch.object(reclaim_probe.os, 'name', 'nt'), \
                 patch.object(reclaim_probe, 'windows_arguments', lambda line: line.split()), \
                 patch.object(reclaim_probe, 'protected_process', protected), \
+                patch.object(reclaim_probe, 'running_distros', lambda: ['Ubuntu']), \
+                patch.object(reclaim_probe, 'wsl', lambda distro, *command, stdin=None: '1 /sbin/init\n'), \
                 patch.object(reclaim_probe, 'exited', lambda pid: pid == 12):
             with inventory(*idle):
                 self.assertIn('coldcontribute', reclaim_probe.running_programs())
@@ -2728,6 +2801,39 @@ class ReclaimTests(unittest.TestCase):
                 with self.subTest(process=unreadable), inventory(*idle, unreadable), \
                         self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: '
                                                            'CommandLine unreadable for process ' + str(unreadable[0])):
+                    reclaim_probe.running_programs()
+
+    def test_windows_owner_check_sees_products_running_inside_wsl(self):
+        listing = json.dumps([dict(ProcessId=9, Name='vmmemWSL', ExecutablePath=None, CommandLine=None),
+                              dict(ProcessId=11, Name='explorer.exe', ExecutablePath='C:\\explorer.exe', CommandLine='explorer.exe')])
+        def run(command, **kwargs):
+            if command[0] == 'powershell':
+                return subprocess.CompletedProcess(command, 0, listing, '')
+            return subprocess.CompletedProcess(command, 0, b'U\x00b\x00u\x00n\x00t\x00u\x00\n\x00', b'')
+        def wsl(distro, *command, stdin=None):
+            self.assertEqual((distro, command), ('Ubuntu', ('ps', '-A', '-ww', '-o', 'pid=,args=')))
+            return '  1 /sbin/init\n 42 /usr/bin/python3 /mnt/c/tools/coldcontribute.py\n'
+        def failing(distro, *command, stdin=None):
+            raise RuntimeError('process-use inventory incomplete: WSL distro Ubuntu: boom')
+        windows = Mock(wraps=os)
+        windows.name = 'nt'
+        with patch.object(reclaim_probe, 'os', windows), patch.object(reclaim_probe.subprocess, 'run', run), \
+                patch.object(reclaim_probe, 'windows_arguments', lambda line: line.split()):
+            with patch.object(reclaim_probe, 'wsl', wsl):
+                self.assertIn('coldcontribute', reclaim_probe.running_programs())
+                listing = json.dumps([dict(ProcessId=11, Name='explorer.exe', ExecutablePath='C:\\explorer.exe',
+                                           CommandLine='explorer.exe')])
+                self.assertIn('coldcontribute', reclaim_probe.running_programs())
+            with patch.object(reclaim_probe, 'running_distros', Mock(side_effect=RuntimeError('process-use inventory incomplete: vmmemWSL is running but no WSL distro is listed'))), \
+                    self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: process-use inventory incomplete'):
+                reclaim_probe.running_programs()
+            with patch.object(reclaim_probe, 'wsl', failing), \
+                    self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: '):
+                reclaim_probe.running_programs()
+            for broken in ('', '\n', 'garbage coldcontribute\n', '42\n', '1 /sbin/init\n42\n'):
+                with self.subTest(listing=broken), \
+                        patch.object(reclaim_probe, 'wsl', lambda distro, *command, stdin=None: broken), \
+                        self.assertRaisesRegex(ValueError, '^artifact marker owner check incomplete, protecting: '):
                     reclaim_probe.running_programs()
 
     def test_remove_rechecks_outside_markers_after_verifying_the_copy(self):

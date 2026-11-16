@@ -224,6 +224,26 @@ class ProtectionTests(CoreCase):
         self.assertIn('C:\\tools\\task.exe', paths)
         self.assertIn('C:\\Users\\user\\REPOS\\Task App', paths)
 
+    def test_windows_task_running_a_wsl_mnt_path_protects_the_worktree(self):
+        worktree = 'C:\\Users\\user\\REPOS\\.worktrees\\app\\main'
+        actions = [{'Execute': 'wsl.exe', 'Arguments': '-u root -e bash "/mnt/c/Users/user/REPOS/.worktrees/app/main/tools/run.sh" --requests',
+                    'WorkingDirectory': None},
+                   {'Execute': 'wsl.exe', 'Arguments': '-e bash /mnt/d/jobs/nightly.sh', 'WorkingDirectory': None}]
+        paths = protect.extract_paths(json.dumps(actions), 'C:\\Users\\user', True)
+        protection = protect.Protection(hosts.Host('win', 'powershell'), 'C:\\Users\\user', paths, [])
+        self.assertIn('scheduler references', protection.batch([worktree, 'D:\\jobs'])[worktree])
+        self.assertIn('scheduler references', protection.batch(['D:\\jobs'])['D:\\jobs'])
+        for text, candidate in (('C:\\jobs\\foo=/mnt/c/tools/run.sh', 'C:\\jobs\\foo=\\mnt\\c\\tools'),
+                                ('bash /mnt/c/jobs/My\\ Folder/run.sh', 'C:\\jobs\\My Folder'),
+                                ('bash "/mnt/e/My Jobs/run.sh"', 'E:\\My Jobs')):
+            with self.subTest(text=text):
+                protection = protect.Protection(hosts.Host('win', 'powershell'), 'C:\\Users\\user',
+                                                protect.extract_paths(text, 'C:\\Users\\user', True), [])
+                self.assertIn('scheduler references', protection.batch([candidate])[candidate])
+        self.assertFalse(any(protect.overlaps(path, 'C:\\x', True)
+                             for path in protect.extract_paths('bash /home/user/mnt/c/x/run.sh', 'C:\\Users\\user', True)))
+        self.assertIn('/mnt/c/Users/user/run.sh', protect.extract_paths('bash /mnt/c/Users/user/run.sh', '/home/user'))
+
     def test_overlap_both_directions_and_component_boundary(self):
         self.assertTrue(protect.overlaps('/repos/app', '/repos/app/run.py'))
         self.assertTrue(protect.overlaps('/repos/app/data', '/repos/app'))

@@ -144,12 +144,38 @@ def codex_threads():
     return [(cwd, updated) for cwd, updated in rows if os.path.normcase(os.path.abspath(cwd)) not in broad]
 
 
-CLAUDE_KEY = re.compile(rb'"cwd"\s*:')
-CLAUDE_CWD = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
-
-
 def raise_error(error):
     raise error
+
+
+def unique_keys(pairs):
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError('duplicate key')
+    return dict(pairs)
+
+
+def record_cwds(value, session, parents=()):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == 'cwd' and isinstance(item, str):
+                yield item
+            elif key == 'cwd' and not (parents == ('input_schema', 'properties') and isinstance(item, dict)):
+                raise ValueError('unexpected cwd in ' + str(session))
+            else:
+                yield from record_cwds(item, session, (parents + (key,))[-2:])
+    elif isinstance(value, list):
+        for item in value:
+            yield from record_cwds(item, session)
+
+
+def claude_cwds(content, session):
+    for line in content.split(b'\n'):
+        if line.strip():
+            try:
+                record = json.loads(line, object_pairs_hook=unique_keys)
+            except ValueError:
+                raise ValueError('unexpected cwd in ' + str(session)) from None
+            yield from record_cwds(record, session)
 
 
 def claude_threads(since=None):
@@ -172,11 +198,7 @@ def claude_threads(since=None):
                 content = session.read_bytes()
             except FileNotFoundError:
                 continue
-            found = CLAUDE_CWD.findall(content)
-            if len(found) != len(CLAUDE_KEY.findall(content)):
-                raise ValueError('unexpected cwd in ' + str(session))
-            for raw in set(found):
-                cwd = json.loads(b'"' + raw + b'"')
+            for cwd in set(claude_cwds(content, session)):
                 if not os.path.isabs(cwd):
                     raise ValueError('unexpected cwd in ' + str(session))
                 latest[cwd] = max(latest.get(cwd, updated), updated)
@@ -416,14 +438,18 @@ def wsl(distro, *command, stdin=None):
     return result.stdout
 
 
-def wsl_references():
+def running_distros():
     listing = subprocess.run(['wsl.exe', '--list', '--running', '--quiet'], capture_output=True, check=True).stdout
     text = listing.decode('utf-16-le') if b'\x00' in listing else listing.decode()
     distros = [line.strip() for line in text.splitlines() if line.strip()]
     if not distros:
         raise RuntimeError('process-use inventory incomplete: vmmemWSL is running but no WSL distro is listed')
+    return distros
+
+
+def wsl_references():
     paths = []
-    for distro in distros:
+    for distro in running_distros():
         for namespace in json.loads(wsl(distro, 'python3', '-', '/proc', '--by-namespace', stdin=PROC_SCAN)):
             mounts = drvfs_mounts(namespace['mountinfo'])
             paths.extend(filter(None, (windows_from_wsl(path, mounts) for path in namespace['paths'])))
@@ -932,9 +958,12 @@ def running_programs():
             script = "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
             rows = json.loads(subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', script],
                                              capture_output=True, text=True, check=True).stdout)
+            rows = rows if isinstance(rows, list) else [rows]
             commands = [(row['ProcessId'], [row.get('Name') or ''] + windows_arguments(row['CommandLine']))
-                        for row in (rows if isinstance(rows, list) else [rows]) if row['ProcessId'] not in (0, 4)
+                        for row in rows if row['ProcessId'] not in (0, 4)
                         and (row.get('CommandLine') or unreadable_command_line(row))]
+            commands += [(None, args) for distro in running_distros()
+                         for _, args in ps_rows(wsl(distro, 'ps', '-A', '-ww', '-o', 'pid=,args='))]
         else:
             command = ['ps', '-A', '-ww', '-o', 'pid=,args=']
             if sys.platform == 'darwin':
@@ -946,12 +975,19 @@ def running_programs():
                 if os.geteuid() and hides_processes(Path('/proc/self/mountinfo').read_text()):
                     raise ValueError("/proc hides other users' processes")
                 listing = subprocess.run(command, capture_output=True, text=True, check=True).stdout
-            commands = [(int(pid), args.split()) for pid, _, args in
-                        (line.strip().partition(' ') for line in listing.split('\n') if line.strip())]
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+            commands = ps_rows(listing)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.CalledProcessError) as error:
         raise ValueError('artifact marker owner check incomplete, protecting: ' + str(error)) from None
     return {re.split(r'[\\/]', token)[-1].split('.')[0].casefold()
             for pid, tokens in commands if pid != os.getpid() for token in tokens}
+
+
+def ps_rows(listing):
+    rows = [(int(pid), args.split()) for pid, _, args in
+            (line.strip().partition(' ') for line in listing.split('\n') if line.strip())]
+    if not rows or not all(args for _, args in rows):
+        raise ValueError('empty process list or a process without a command line')
+    return rows
 
 
 def hides_processes(mountinfo):

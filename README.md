@@ -33,14 +33,14 @@ Other ways to install (pipx, pip in a virtual environment, or running from the c
 ## Quick start (one machine)
 
 ```sh
-uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.1
+uv tool install git+https://github.com/TayHCode/coldcleaner@v0.3.2
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner"
-[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.1/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
+[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml" ] || { curl -fsSL https://raw.githubusercontent.com/TayHCode/coldcleaner/v0.3.2/rules.example.toml -o "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" && mv "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml.part" "${XDG_CONFIG_HOME:-$HOME/.config}/coldcleaner/rules.toml"; }
 coldcleaner doctor
 coldcleaner reclaim --host local
 ```
 
-1. `uv tool install` installs the v0.3.1 release and adds a `coldcleaner` command to `~/.local/bin`. From a clone, `uv tool install .` installs that copy.
+1. `uv tool install` installs the v0.3.2 release and adds a `coldcleaner` command to `~/.local/bin`. From a clone, `uv tool install .` installs that copy.
 2. The next two lines download the example rules file to `~/.config/coldcleaner/rules.toml` (or `$XDG_CONFIG_HOME/coldcleaner/rules.toml` if you set `XDG_CONFIG_HOME`), which is where coldcleaner looks. An existing file is kept.
 3. `doctor` checks what cleanup needs and prints one PASS or FAIL line for each item. It changes nothing. It exits 1 while anything fails; that is expected on a new machine, and the dry run below still works.
 4. `reclaim --host local` is a dry run. It changes nothing, writes a report and prints the report's path, then one line per host with its disk use and how much it would free. The report lists each proposed action with its reason, and sums skips by reason.

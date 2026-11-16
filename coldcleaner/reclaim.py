@@ -144,6 +144,22 @@ def missing_repository(stdout):
     return bool(errors) and all(error.get('type') == 'NOT_FOUND' and error.get('path') == ['repository'] for error in errors)
 
 
+def published_main(listing):
+    refs = dict(reversed(line.split()) for line in listing.splitlines() if len(line.split()) == 2)
+    return refs.get('refs/heads/main') or refs.get('refs/heads/master')
+
+
+def merged_on_github(repo, head, main):
+    if not main or not all(re.fullmatch('[0-9a-f]{40}', sha) for sha in (main, head)):
+        return False
+    try:
+        result = hosts.run(hosts.LOCAL, shlex.join(
+            ['gh', 'api', f'repos/{repo}/compare/{main}...{head}', '--jq', '.status']), timeout=180)
+    except subprocess.CalledProcessError:
+        return False
+    return result.stdout.decode().strip() in ('behind', 'identical')
+
+
 def completion(state, prs):
     if state['dirty'] or state['stashes']:
         return 'IN USE: uncommitted work or stashes'
@@ -615,7 +631,7 @@ class Reclaimer:
         self.rules = config['hosts'].get(host.name, {})
         if isinstance(self.protection, protect.Protection):
             self.protection.broad_paths.update(self.rules.get('shared_roots', []))
-        self.listings = {}; self.prs = {}
+        self.listings = {}; self.prs = {}; self.merges = {}
         self.checked = {}; self.activity = None; self.prefetched = {}; self.unsized = []
         self.code = version.revision()
         self.removed = 0; self.removed_bytes = 0; self.limit_reached = False
@@ -765,6 +781,11 @@ class Reclaimer:
         key = repo, state['branch'], state['head']
         if fresh or key not in self.prs:
             self.prs[key] = pull_requests(*key)
+        if state['published'] and not state['merged']:
+            check = repo, state['head'], published_main(self.listings[repo])
+            if check not in self.merges:
+                self.merges[check] = merged_on_github(*check)
+            state['merged'] = self.merges[check]
         return state, self.prs[key], self.listings[repo]
 
     def prefetch(self, candidates):
@@ -935,7 +956,7 @@ class Reclaimer:
                              ('; ignored files SHA-256 verified at ' + saved.archive_path if saved else '') +
                              ('; unique reflog commits bundled in head.bundle' if state['reflog'] else ''),
                              head=removed['head'], branch=removed['branch'], remote=removed['remote'],
-                             merged=removed['merged'], rule=rule, idle_days=days,
+                             merged=removed['merged'] or current['merged'], rule=rule, idle_days=days,
                              pull_requests=[row['url'] for row in current_prs if row['headRefOid'] == removed['head']])
                     if gated:
                         self.consume(ident)

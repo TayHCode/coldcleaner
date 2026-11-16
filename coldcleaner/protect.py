@@ -68,6 +68,14 @@ def extract_paths(text, home, windows=False, environment=None):
     for key, value in (environment or {}).items():
         text = re.sub('%' + re.escape(key) + '%', lambda _: value, text, flags=re.I)
         text = re.sub(r'\$env:' + re.escape(key), lambda _: value, text, flags=re.I)
+    paths = found_paths(text, windows)
+    if windows:
+        wsl = (re.fullmatch(r'/mnt/([A-Za-z])(/.*)?', path) for path in found_paths(text, False))
+        paths |= {match[1].upper() + ':\\' + (match[2] or '').strip('/').replace('/', '\\') for match in wsl if match}
+    return paths
+
+
+def found_paths(text, windows):
     pattern = r'[A-Za-z]:[\\/][^\s\"<>|;,}]*' if windows else r'/(?:[^\s\"\'<>;,}\\]|\\ )+'
     paths = set(re.findall(pattern, text))
     quoted = r'[\"\']([A-Za-z]:[\\/][^\"\']+)[\"\']' if windows else r'[\"\'](/[^\"\'\n]+)[\"\']'
